@@ -1,81 +1,92 @@
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const root = process.cwd();
-const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-const version = packageJson.version;
-const manifest = JSON.parse(
-  fs.readFileSync('/opt/affine-mcp-patch/versions.json', 'utf8')
-);
+const bundlePath = path.resolve(root, './dist/main.js');
+const mapPath = path.resolve(root, './dist/main.js.map');
 
-const cfg = manifest[version];
-if (!cfg) {
-  throw new Error(`Unsupported AFFiNE version: ${version}`);
+function fail(message) {
+  throw new Error(`[AFFiNE MCP Patch] ${message}`);
 }
-
-const bundlePath = path.resolve(root, cfg.bundle);
-const mapPath = path.resolve(root, cfg.sourceMap);
 
 if (!fs.existsSync(bundlePath) || !fs.existsSync(mapPath)) {
-  throw new Error('Expected AFFiNE bundle or source map is missing.');
+  fail('Expected ./dist/main.js and ./dist/main.js.map were not found.');
 }
 
+// 1. Verify the upstream source semantically. This deliberately does not care
+// about the AFFiNE version number.
 const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
-const providerIndex = map.sources.findIndex(s =>
-  s.endsWith('plugins/copilot/mcp/provider.ts')
-);
+const providerIndexes = map.sources
+  .map((source, index) => ({ source, index }))
+  .filter(({ source }) => source.endsWith('plugins/copilot/mcp/provider.ts'));
 
-if (providerIndex < 0) {
-  throw new Error('AFFiNE MCP provider source was not found in source map.');
+if (providerIndexes.length !== 1) {
+  fail(`Expected exactly one MCP provider source, found ${providerIndexes.length}.`);
 }
 
-const providerSource = map.sourcesContent?.[providerIndex] || '';
-const expectedSource = [
-  'accessMode === McpAccessMode.READ_WRITE',
-  '(env.dev || env.namespaces.canary)',
+const providerSource = map.sourcesContent?.[providerIndexes[0].index] || '';
+const requiredMarkers = [
+  'McpAccessMode.READ_WRITE',
+  'env.namespaces.canary',
   "name: 'create_document'",
   "name: 'update_document'",
   "name: 'update_document_meta'"
 ];
 
-for (const marker of expectedSource) {
+for (const marker of requiredMarkers) {
   if (!providerSource.includes(marker)) {
-    throw new Error(`Expected MCP source marker missing: ${marker}`);
+    fail(`Upstream MCP structure changed; missing source marker: ${marker}`);
   }
 }
 
-const bundle = fs.readFileSync(bundlePath, 'utf8');
-const bundleSha256 = crypto.createHash('sha256').update(bundle).digest('hex');
+// Do not patch if upstream already permits READ_WRITE without the dev/canary
+// restriction. In that case this project is no longer needed for this gate.
+const gateSourcePattern = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/m;
+const sourceGateMatches = providerSource.match(new RegExp(gateSourcePattern.source, 'gm')) || [];
 
-if (cfg.status !== 'ready') {
-  console.error('AFFiNE MCP patch is intentionally NOT applied yet.');
-  console.error(`AFFiNE version: ${version}`);
-  console.error(`main.js sha256: ${bundleSha256}`);
-  console.error('Capture the exact compiled MCP condition and add it to versions.json first.');
-  process.exit(42);
+if (sourceGateMatches.length === 0) {
+  fail('The known dev/canary MCP write gate is no longer present. Review upstream before building.');
+}
+if (sourceGateMatches.length !== 1) {
+  fail(`Expected one MCP write gate in source, found ${sourceGateMatches.length}.`);
 }
 
-if (!cfg.search || !cfg.replace || !cfg.bundleSha256) {
-  throw new Error('Ready version entry is incomplete.');
+// 2. Patch the compiled bundle. Webpack/minification may rename the object that
+// carries env, so the pattern intentionally keys off the stable property names
+// and the READ_WRITE branch shape rather than a version/hash.
+let bundle = fs.readFileSync(bundlePath, 'utf8');
+
+// The write tools must all be present in the same bundle before touching it.
+for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
+  if (!bundle.includes(marker)) {
+    fail(`Compiled bundle does not contain expected tool marker: ${marker}`);
+  }
 }
 
-if (bundleSha256 !== cfg.bundleSha256) {
-  throw new Error(
-    `Bundle hash mismatch for AFFiNE ${version}. Expected ${cfg.bundleSha256}, got ${bundleSha256}`
-  );
+// Candidate condition: <accessMode>===<enum>.READ_WRITE && (<env>.dev || <env>.namespaces.canary)
+// Identifiers are intentionally generic to survive ordinary minification/name changes.
+const compiledGate = /([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.READ_WRITE&&\(([A-Za-z_$][\w$]*)\.dev\|\|\3\.namespaces\.canary\)/g;
+const matches = [...bundle.matchAll(compiledGate)];
+
+if (matches.length !== 1) {
+  fail(`Could not identify one unique compiled MCP write gate; found ${matches.length}. Upstream likely changed.`);
 }
 
-const occurrences = bundle.split(cfg.search).length - 1;
-if (occurrences !== 1) {
-  throw new Error(`Patch signature occurrence count is ${occurrences}, expected exactly 1.`);
+const match = matches[0];
+const original = match[0];
+const replacement = `${match[1]}===${match[2]}.READ_WRITE`;
+
+bundle = bundle.slice(0, match.index) + replacement + bundle.slice(match.index + original.length);
+
+// 3. Verify that only the intended gate disappeared and tool markers remain.
+if (bundle.includes(original)) {
+  fail('Patch verification failed: original write gate still present.');
+}
+for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
+  if (!bundle.includes(marker)) {
+    fail(`Patch verification failed: tool marker disappeared: ${marker}`);
+  }
 }
 
-const patched = bundle.replace(cfg.search, cfg.replace);
-fs.writeFileSync(bundlePath, patched);
-
-if (!patched.includes(cfg.replace)) {
-  throw new Error('Patch verification failed.');
-}
-
-console.log(`AFFiNE ${version}: MCP patch applied successfully.`);
+fs.writeFileSync(bundlePath, bundle);
+console.log('[AFFiNE MCP Patch] MCP READ_WRITE gate patched successfully.');
