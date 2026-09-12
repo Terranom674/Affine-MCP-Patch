@@ -1,0 +1,12 @@
+services:
+  affine:
+    build:
+      context: ../Affine-MCP-Patch
+      args:
+        AFFINE_BASE: ghcr.io/toeverything/affine:stable
+    image: affine-mcp-patched:local
+    environment:
+      AFFINE_MCP_WRITE_ENABLED: "true"
+
+  affine_migration:
+    image: affine-mcp-patched:local
