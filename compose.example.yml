@@ -7,6 +7,7 @@ services:
     image: affine-mcp-patched:local
     environment:
       AFFINE_ENV: production
+      AFFINE_MCP_WRITE_ENABLED: "true"
     # Existing volumes, env_file, depends_on and ports belong in the real AFFiNE compose file.
 
   affine_migration:
