@@ -13,104 +13,132 @@ if (!fs.existsSync(bundlePath) || !fs.existsSync(mapPath)) {
   fail('Expected ./dist/main.js and ./dist/main.js.map were not found.');
 }
 
-// 1. Verify the upstream source semantically. This deliberately does not care
-// about the AFFiNE version number.
 const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
-const providerIndexes = map.sources
-  .map((source, index) => ({ source, index }))
-  .filter(({ source }) => source.endsWith('plugins/copilot/mcp/provider.ts'));
 
-if (providerIndexes.length !== 1) {
-  fail(`Expected exactly one MCP provider source, found ${providerIndexes.length}.`);
+function sourceEndingWith(suffix) {
+  const matches = map.sources
+    .map((source, index) => ({ source, index }))
+    .filter(({ source }) => source.endsWith(suffix));
+  if (matches.length !== 1) {
+    fail(`Expected exactly one ${suffix}, found ${matches.length}.`);
+  }
+  return map.sourcesContent?.[matches[0].index] || '';
 }
 
-const providerSource = map.sourcesContent?.[providerIndexes[0].index] || '';
-const requiredMarkers = [
+const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
+const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
+
+for (const marker of [
   'McpAccessMode.READ_WRITE',
   'env.namespaces.canary',
   "name: 'create_document'",
   "name: 'update_document'",
   "name: 'update_document_meta'"
-];
-
-for (const marker of requiredMarkers) {
+]) {
   if (!providerSource.includes(marker)) {
-    fail(`Upstream MCP structure changed; missing source marker: ${marker}`);
+    fail(`Provider structure changed; missing marker: ${marker}`);
   }
 }
 
-const gateSourcePattern = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/m;
-const sourceGateMatches = providerSource.match(new RegExp(gateSourcePattern.source, 'gm')) || [];
-
-if (sourceGateMatches.length !== 1) {
-  fail(`Expected exactly one known MCP write gate in source, found ${sourceGateMatches.length}.`);
+for (const marker of [
+  'mcpCredentialReadWriteAvailable()',
+  "throw new BadRequestException('MCP write tools are not available')",
+  'input.accessMode === McpAccessMode.READ_WRITE'
+]) {
+  if (!resolverSource.includes(marker)) {
+    fail(`Resolver structure changed; missing marker: ${marker}`);
+  }
 }
 
-// 2. Patch ONLY the compiled MCP write condition.
+const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
+if ((providerSource.match(providerGateSource) || []).length !== 1) {
+  fail('Expected exactly one provider READ_WRITE gate in source.');
+}
+
+const availabilitySource = /mcpCredentialReadWriteAvailable\(\)\s*\{\s*return\s+env\.dev\s*\|\|\s*env\.namespaces\.canary;?\s*\}/gm;
+if ((resolverSource.match(availabilitySource) || []).length !== 1) {
+  fail('Expected exactly one READ_WRITE availability gate in resolver source.');
+}
+
+const creationGuardSource = /input\.accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*!env\.dev\s*&&\s*!env\.namespaces\.canary/gm;
+if ((resolverSource.match(creationGuardSource) || []).length !== 1) {
+  fail('Expected exactly one READ_WRITE credential creation guard in resolver source.');
+}
+
 const originalBundle = fs.readFileSync(bundlePath, 'utf8');
+let patchedBundle = originalBundle;
+const changes = [];
 
-for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
-  if (!originalBundle.includes(marker)) {
-    fail(`Compiled bundle does not contain expected tool marker: ${marker}`);
+function applyUnique(regex, replacer, label) {
+  const matches = [...patchedBundle.matchAll(regex)];
+  if (matches.length !== 1) {
+    fail(`${label}: expected exactly one compiled match, found ${matches.length}.`);
   }
+  const m = matches[0];
+  const original = m[0];
+  const replacement = typeof replacer === 'function' ? replacer(m) : replacer;
+  if (!replacement || replacement === original) {
+    fail(`${label}: refusing no-op patch.`);
+  }
+  const index = m.index;
+  patchedBundle = patchedBundle.slice(0, index) + replacement + patchedBundle.slice(index + original.length);
+  changes.push({ label, original, replacement });
 }
 
-// Bundlers may compile imported objects as namespaced member chains, e.g.
-// prisma_client.McpAccessMode.READ_WRITE and env_module.env.namespaces.canary.
-// Accept those ordinary representation changes, but still require exactly one
-// complete gate with the same accessMode/env pair.
 const ident = '[A-Za-z_$][\\w$]*';
 const chain = `${ident}(?:\\.${ident})*`;
-const compiledGate = new RegExp(
-  `(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`,
-  'g'
+
+// 1) Provider: expose write tools when the explicit env switch is true.
+applyUnique(
+  new RegExp(`(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`, 'g'),
+  m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true")`,
+  'provider write gate'
 );
-const matches = [...originalBundle.matchAll(compiledGate)];
 
-if (matches.length !== 1) {
-  const canaryPos = originalBundle.indexOf('.namespaces.canary');
-  const context = canaryPos >= 0
-    ? originalBundle.slice(Math.max(0, canaryPos - 220), Math.min(originalBundle.length, canaryPos + 220))
-    : 'no .namespaces.canary marker in bundle';
-  fail(`Could not identify one unique compiled MCP write gate; found ${matches.length}. Context: ${context}`);
+// 2) GraphQL capability flag: report READ_WRITE as available under the same switch.
+applyUnique(
+  /mcpCredentialReadWriteAvailable\(\)\{return env\.dev\|\|env\.namespaces\.canary\}/g,
+  'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true"}',
+  'resolver availability gate'
+);
+
+// 3) GraphQL credential creation guard: do not reject READ_WRITE when switch is true.
+applyUnique(
+  new RegExp(`(\\.accessMode\\s*===\\s*${chain}\\.READ_WRITE\\s*&&\\s*!env\\.dev\\s*&&\\s*!env\\.namespaces\\.canary)`, 'g'),
+  m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!=="true"`,
+  'resolver credential creation gate'
+);
+
+// Hard verification: only these three exact substitutions are allowed.
+let reconstructed = originalBundle;
+for (const change of changes) {
+  const count = reconstructed.split(change.original).length - 1;
+  if (count !== 1) {
+    fail(`${change.label}: original fragment is not uniquely reconstructable.`);
+  }
+  reconstructed = reconstructed.replace(change.original, change.replacement);
+}
+if (reconstructed !== patchedBundle) {
+  fail('Bundle contains changes outside the three MCP write conditions.');
 }
 
-const match = matches[0];
-const originalGate = match[0];
-const replacementGate = `${match[1]}===${match[2]}.READ_WRITE&&(${match[3]}.dev||${match[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true")`;
-
-if (originalGate === replacementGate) {
-  fail('Refusing no-op patch.');
+let reversed = patchedBundle;
+for (const change of [...changes].reverse()) {
+  const count = reversed.split(change.replacement).length - 1;
+  if (count !== 1) {
+    fail(`${change.label}: patched fragment is not uniquely reversible.`);
+  }
+  reversed = reversed.replace(change.replacement, change.original);
 }
-
-const patchedBundle =
-  originalBundle.slice(0, match.index) +
-  replacementGate +
-  originalBundle.slice(match.index + originalGate.length);
-
-// 3. Hard verification: reconstruct the only allowed change and require the
-// resulting bundle to match it byte-for-byte. This guarantees that this script
-// changes nothing in AFFiNE except the single MCP write condition.
-const expectedBundle = originalBundle.replace(originalGate, replacementGate);
-if (patchedBundle !== expectedBundle) {
-  fail('Patch verification failed: bundle contains changes outside the MCP write condition.');
-}
-
-const reverseCheck = patchedBundle.replace(replacementGate, originalGate);
-if (reverseCheck !== originalBundle) {
-  fail('Patch verification failed: patch is not exactly reversible to the upstream bundle.');
-}
-
-const replacementOccurrences = patchedBundle.split(replacementGate).length - 1;
-if (replacementOccurrences !== 1) {
-  fail(`Patch verification failed: patched write condition occurs ${replacementOccurrences} times.`);
+if (reversed !== originalBundle) {
+  fail('Patch is not exactly reversible to the upstream bundle.');
 }
 
 for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
   if (!patchedBundle.includes(marker)) {
-    fail(`Patch verification failed: tool marker disappeared: ${marker}`);
+    fail(`Tool marker disappeared: ${marker}`);
   }
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Applied exactly one change: MCP READ_WRITE condition extended with AFFINE_MCP_WRITE_ENABLED.');
+console.log('[AFFiNE MCP Patch] Applied exactly three MCP WRITE condition changes; no other bundle content changed.');
