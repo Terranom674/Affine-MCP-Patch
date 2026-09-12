@@ -39,54 +39,68 @@ for (const marker of requiredMarkers) {
   }
 }
 
-// Do not patch if upstream already permits READ_WRITE without the dev/canary
-// restriction. In that case this project is no longer needed for this gate.
 const gateSourcePattern = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/m;
 const sourceGateMatches = providerSource.match(new RegExp(gateSourcePattern.source, 'gm')) || [];
 
-if (sourceGateMatches.length === 0) {
-  fail('The known dev/canary MCP write gate is no longer present. Review upstream before building.');
-}
 if (sourceGateMatches.length !== 1) {
-  fail(`Expected one MCP write gate in source, found ${sourceGateMatches.length}.`);
+  fail(`Expected exactly one known MCP write gate in source, found ${sourceGateMatches.length}.`);
 }
 
-// 2. Patch the compiled bundle. Webpack/minification may rename the object that
-// carries env, so the pattern intentionally keys off the stable property names
-// and the READ_WRITE branch shape rather than a version/hash.
-let bundle = fs.readFileSync(bundlePath, 'utf8');
+// 2. Patch ONLY the compiled MCP write condition.
+const originalBundle = fs.readFileSync(bundlePath, 'utf8');
 
-// The write tools must all be present in the same bundle before touching it.
 for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
-  if (!bundle.includes(marker)) {
+  if (!originalBundle.includes(marker)) {
     fail(`Compiled bundle does not contain expected tool marker: ${marker}`);
   }
 }
 
-// Candidate condition: <accessMode>===<enum>.READ_WRITE && (<env>.dev || <env>.namespaces.canary)
-// Identifiers are intentionally generic to survive ordinary minification/name changes.
+// Candidate condition:
+// <accessMode>===<enum>.READ_WRITE && (<env>.dev || <env>.namespaces.canary)
+// Identifiers are generic to survive ordinary minification/name changes.
 const compiledGate = /([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.READ_WRITE&&\(([A-Za-z_$][\w$]*)\.dev\|\|\3\.namespaces\.canary\)/g;
-const matches = [...bundle.matchAll(compiledGate)];
+const matches = [...originalBundle.matchAll(compiledGate)];
 
 if (matches.length !== 1) {
   fail(`Could not identify one unique compiled MCP write gate; found ${matches.length}. Upstream likely changed.`);
 }
 
 const match = matches[0];
-const original = match[0];
-const replacement = `${match[1]}===${match[2]}.READ_WRITE`;
+const originalGate = match[0];
+const replacementGate = `${match[1]}===${match[2]}.READ_WRITE&&(${match[3]}.dev||${match[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true")`;
 
-bundle = bundle.slice(0, match.index) + replacement + bundle.slice(match.index + original.length);
-
-// 3. Verify that only the intended gate disappeared and tool markers remain.
-if (bundle.includes(original)) {
-  fail('Patch verification failed: original write gate still present.');
+if (originalGate === replacementGate) {
+  fail('Refusing no-op patch.');
 }
+
+const patchedBundle =
+  originalBundle.slice(0, match.index) +
+  replacementGate +
+  originalBundle.slice(match.index + originalGate.length);
+
+// 3. Hard verification: reconstruct the only allowed change and require the
+// resulting bundle to match it byte-for-byte. This guarantees that this script
+// changes nothing in AFFiNE except the single MCP write condition.
+const expectedBundle = originalBundle.replace(originalGate, replacementGate);
+if (patchedBundle !== expectedBundle) {
+  fail('Patch verification failed: bundle contains changes outside the MCP write condition.');
+}
+
+const reverseCheck = patchedBundle.replace(replacementGate, originalGate);
+if (reverseCheck !== originalBundle) {
+  fail('Patch verification failed: patch is not exactly reversible to the upstream bundle.');
+}
+
+const replacementOccurrences = patchedBundle.split(replacementGate).length - 1;
+if (replacementOccurrences !== 1) {
+  fail(`Patch verification failed: patched write condition occurs ${replacementOccurrences} times.`);
+}
+
 for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
-  if (!bundle.includes(marker)) {
+  if (!patchedBundle.includes(marker)) {
     fail(`Patch verification failed: tool marker disappeared: ${marker}`);
   }
 }
 
-fs.writeFileSync(bundlePath, bundle);
-console.log('[AFFiNE MCP Patch] MCP READ_WRITE gate patched successfully.');
+fs.writeFileSync(bundlePath, patchedBundle);
+console.log('[AFFiNE MCP Patch] Applied exactly one change: MCP READ_WRITE condition extended with AFFINE_MCP_WRITE_ENABLED.');
