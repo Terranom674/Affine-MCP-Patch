@@ -7,6 +7,9 @@ services:
     image: affine-mcp-patched:local
     environment:
       AFFINE_MCP_WRITE_ENABLED: "true"
+      AFFINE_BACKEND_RUNTIME_CONFIG_PATH: /root/.affine/config/config.json
 
   affine_migration:
     image: affine-mcp-patched:local
+    environment:
+      AFFINE_BACKEND_RUNTIME_CONFIG_PATH: /root/.affine/config/config.json
