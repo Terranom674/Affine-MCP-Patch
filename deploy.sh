@@ -22,6 +22,13 @@ fi
 
 cd "$AFFINE_DIR"
 
+# The running container is named affine_postgres, but the Compose service itself
+# is not necessarily called affine_postgres. Resolve the real service name from
+# Docker's Compose label instead of guessing it.
+POSTGRES_SERVICE="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' affine_postgres 2>/dev/null || true)"
+[ -n "$POSTGRES_SERVICE" ] || fail "could not resolve PostgreSQL Compose service from container affine_postgres"
+echo "PostgreSQL Compose service: $POSTGRES_SERVICE"
+
 cp -f "$COMPOSE_FILE" "$COMPOSE_FILE.bak-before-mcp-upgrade"
 
 echo "--- Upgrade PostgreSQL/pgvector base ---"
@@ -45,7 +52,7 @@ docker stop affine_server >/dev/null 2>&1 || true
 docker stop affine_migration_job >/dev/null 2>&1 || true
 
 echo "--- Recreate PostgreSQL on Debian 13 / Trixie ---"
-docker compose up -d --force-recreate affine_postgres
+docker compose up -d --force-recreate "$POSTGRES_SERVICE"
 
 for i in $(seq 1 60); do
   if docker exec affine_postgres pg_isready >/dev/null 2>&1; then
