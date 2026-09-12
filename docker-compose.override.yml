@@ -1,4 +1,24 @@
 services:
+  manticore:
+    image: manticoresearch/manticore:29.0.2
+    container_name: affine_manticore
+    restart: unless-stopped
+    environment:
+      searchd.listen: "http:9308"
+      searchd.network_timeout: "30"
+    volumes:
+      - manticore_data:/var/lib/manticore
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- --post-data='SHOW TABLES' 'http://127.0.0.1:9308/sql?mode=raw' >/dev/null",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
   affine:
     build:
       context: ../Affine-MCP-Patch
@@ -8,8 +28,14 @@ services:
     environment:
       AFFINE_MCP_WRITE_ENABLED: "true"
       AFFINE_BACKEND_RUNTIME_CONFIG_PATH: /root/.affine/config/config.json
+    depends_on:
+      manticore:
+        condition: service_healthy
 
   affine_migration:
     image: affine-mcp-patched:local
     environment:
       AFFINE_BACKEND_RUNTIME_CONFIG_PATH: /root/.affine/config/config.json
+
+volumes:
+  manticore_data:
