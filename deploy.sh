@@ -6,6 +6,8 @@ PATCH_DIR=/root/Affine-MCP-Patch
 CONFIG_FILE="$AFFINE_DIR/config/config.json"
 COMPOSE_FILE="$AFFINE_DIR/docker-compose.yml"
 POSTGRES_IMAGE="pgvector/pgvector:pg16-trixie"
+MANTICORE_IMAGE="manticoresearch/manticore:29.0.2"
+MANTICORE_CONTAINER="affine_manticore"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -83,30 +85,50 @@ ACTUAL="$(printf '%s' "$COLLATION_STATUS" | cut -d'|' -f2)"
 [ -n "$STORED" ] && [ "$STORED" = "$ACTUAL" ] || fail "collation version mismatch remains: $COLLATION_STATUS"
 [ "$ACTUAL" = "2.41" ] || fail "expected database collation 2.41, got $ACTUAL"
 
-# MCP doc_search uses AFFiNE's IndexerService. The indexer is disabled by
-# default, even though self-hosted installations have an embedded search
-# provider available. Enable that embedded provider explicitly so document
-# search is usable without an external Elasticsearch/Manticore service.
-if [ ! -f "$CONFIG_FILE" ]; then
-  mkdir -p "$(dirname "$CONFIG_FILE")"
-  printf '%s\n' '{"copilot":{"enabled":true},"indexer":{"enabled":true,"provider":{"type":"embedded"}}}' > "$CONFIG_FILE"
-else
-  docker run --rm -v "$AFFINE_DIR/config:/config" --entrypoint node ghcr.io/toeverything/affine:stable -e '
-    const fs=require("fs");
-    const p="/config/config.json";
-    let c={};
-    try { c=JSON.parse(fs.readFileSync(p,"utf8")); } catch (e) { console.error("Invalid config.json:", e.message); process.exit(1); }
-    c.copilot = {...(c.copilot||{}), enabled:true};
-    c.indexer = {...(c.indexer||{}), enabled:true, provider:{...(c.indexer?.provider||{}), type:"embedded"}};
-    fs.writeFileSync(p, JSON.stringify(c,null,2)+"\n");
-  '
-fi
+# AFFiNE 0.27.4 does not have an embedded search provider. Its supported
+# self-hosted default is ManticoreSearch. Configure the exact provider type and
+# the Docker-internal endpoint used by the service in our compose override.
+mkdir -p "$(dirname "$CONFIG_FILE")"
+python3 - "$CONFIG_FILE" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+config = {}
+if os.path.exists(path):
+    with open(path, encoding='utf-8') as f:
+        config = json.load(f)
+config['copilot'] = {**config.get('copilot', {}), 'enabled': True}
+indexer = dict(config.get('indexer', {}))
+provider = dict(indexer.get('provider', {}))
+provider.update({
+    'type': 'manticoresearch',
+    'endpoint': 'http://manticore:9308',
+})
+indexer.update({'enabled': True, 'provider': provider})
+config['indexer'] = indexer
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PY
 
 echo "--- AFFiNE runtime config ---"
 cat "$CONFIG_FILE"
 
 cp -f "$PATCH_DIR/docker-compose.override.yml" "$AFFINE_DIR/docker-compose.override.yml"
 
+echo "--- Start ManticoreSearch ---"
+docker pull "$MANTICORE_IMAGE"
+docker compose up -d manticore
+for i in $(seq 1 60); do
+  STATUS="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MANTICORE_CONTAINER" 2>/dev/null || true)"
+  [ "$STATUS" = "healthy" ] && break
+  [ "$STATUS" = "unhealthy" ] && { docker logs --tail 100 "$MANTICORE_CONTAINER" >&2 || true; fail "ManticoreSearch became unhealthy"; }
+  sleep 2
+done
+STATUS="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$MANTICORE_CONTAINER" 2>/dev/null || true)"
+[ "$STATUS" = "healthy" ] || fail "ManticoreSearch did not become healthy"
+echo "ManticoreSearch: healthy"
+
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "--- Build and start patched AFFiNE stack ---"
 docker compose up -d --build --force-recreate
 sleep 10
@@ -117,6 +139,19 @@ docker compose ps
 echo "--- Final PostgreSQL check ---"
 docker exec affine_postgres sh -lc "cat /etc/os-release | grep '^PRETTY_NAME='; ldd --version | head -n1"
 docker exec affine_postgres psql -U "$DB_USER" -d "$DB" -At -F '|' -c "SELECT datname,datcollversion,pg_database_collation_actual_version(oid) FROM pg_database WHERE datname=current_database();"
+
+echo "--- Wait for AFFiNE auto-index ---"
+sleep 40
+if docker logs --since "$START_TS" affine_server 2>&1 | grep -q 'search_provider_not_found'; then
+  docker logs --since "$START_TS" affine_server 2>&1 | grep -E 'search_provider_not_found|indexer\.indexWorkspace|IndexerJob' | tail -n 100 >&2 || true
+  fail "AFFiNE still reports search_provider_not_found"
+fi
+
+echo "--- ManticoreSearch tables ---"
+TABLES="$(docker exec "$MANTICORE_CONTAINER" sh -lc "wget -qO- --post-data='SHOW TABLES' 'http://127.0.0.1:9308/sql?mode=raw'")"
+printf '%s\n' "$TABLES"
+printf '%s\n' "$TABLES" | grep -q 'block' || fail "ManticoreSearch block table was not created"
+printf '%s\n' "$TABLES" | grep -q 'doc' || fail "ManticoreSearch doc table was not created"
 
 echo "--- MCP response ---"
 curl -i -sS -X POST "http://127.0.0.1:3010/api/workspaces/test/mcp/" \
