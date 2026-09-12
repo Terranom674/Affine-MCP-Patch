@@ -1,0 +1,14 @@
+services:
+  affine:
+    build:
+      context: .
+      args:
+        AFFINE_BASE: ghcr.io/toeverything/affine:stable
+    image: affine-mcp-patched:local
+    environment:
+      AFFINE_ENV: production
+    # Existing volumes, env_file, depends_on and ports belong in the real AFFiNE compose file.
+
+  affine_migration:
+    image: affine-mcp-patched:local
+    # Use the same patched image for migrations so server and migration stay on the same AFFiNE version.
