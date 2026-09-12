@@ -83,9 +83,13 @@ ACTUAL="$(printf '%s' "$COLLATION_STATUS" | cut -d'|' -f2)"
 [ -n "$STORED" ] && [ "$STORED" = "$ACTUAL" ] || fail "collation version mismatch remains: $COLLATION_STATUS"
 [ "$ACTUAL" = "2.41" ] || fail "expected database collation 2.41, got $ACTUAL"
 
+# MCP doc_search uses AFFiNE's IndexerService. The indexer is disabled by
+# default, even though self-hosted installations have an embedded search
+# provider available. Enable that embedded provider explicitly so document
+# search is usable without an external Elasticsearch/Manticore service.
 if [ ! -f "$CONFIG_FILE" ]; then
   mkdir -p "$(dirname "$CONFIG_FILE")"
-  printf '%s\n' '{"copilot":{"enabled":true}}' > "$CONFIG_FILE"
+  printf '%s\n' '{"copilot":{"enabled":true},"indexer":{"enabled":true,"provider":{"type":"embedded"}}}' > "$CONFIG_FILE"
 else
   docker run --rm -v "$AFFINE_DIR/config:/config" --entrypoint node ghcr.io/toeverything/affine:stable -e '
     const fs=require("fs");
@@ -93,9 +97,13 @@ else
     let c={};
     try { c=JSON.parse(fs.readFileSync(p,"utf8")); } catch (e) { console.error("Invalid config.json:", e.message); process.exit(1); }
     c.copilot = {...(c.copilot||{}), enabled:true};
+    c.indexer = {...(c.indexer||{}), enabled:true, provider:{...(c.indexer?.provider||{}), type:"embedded"}};
     fs.writeFileSync(p, JSON.stringify(c,null,2)+"\n");
   '
 fi
+
+echo "--- AFFiNE runtime config ---"
+cat "$CONFIG_FILE"
 
 cp -f "$PATCH_DIR/docker-compose.override.yml" "$AFFINE_DIR/docker-compose.override.yml"
 
