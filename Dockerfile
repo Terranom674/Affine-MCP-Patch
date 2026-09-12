@@ -4,7 +4,6 @@ FROM ${AFFINE_BASE}
 USER root
 
 COPY patch-mcp.js /opt/affine-mcp-patch/patch-mcp.js
-COPY versions.json /opt/affine-mcp-patch/versions.json
 
 RUN node /opt/affine-mcp-patch/patch-mcp.js
 
