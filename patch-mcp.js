@@ -55,14 +55,24 @@ for (const marker of ['create_document', 'update_document', 'update_document_met
   }
 }
 
-// Candidate condition:
-// <accessMode>===<enum>.READ_WRITE && (<env>.dev || <env>.namespaces.canary)
-// Identifiers are generic to survive ordinary minification/name changes.
-const compiledGate = /([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.READ_WRITE&&\(([A-Za-z_$][\w$]*)\.dev\|\|\3\.namespaces\.canary\)/g;
+// Bundlers may compile imported objects as namespaced member chains, e.g.
+// prisma_client.McpAccessMode.READ_WRITE and env_module.env.namespaces.canary.
+// Accept those ordinary representation changes, but still require exactly one
+// complete gate with the same accessMode/env pair.
+const ident = '[A-Za-z_$][\\w$]*';
+const chain = `${ident}(?:\\.${ident})*`;
+const compiledGate = new RegExp(
+  `(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`,
+  'g'
+);
 const matches = [...originalBundle.matchAll(compiledGate)];
 
 if (matches.length !== 1) {
-  fail(`Could not identify one unique compiled MCP write gate; found ${matches.length}. Upstream likely changed.`);
+  const canaryPos = originalBundle.indexOf('.namespaces.canary');
+  const context = canaryPos >= 0
+    ? originalBundle.slice(Math.max(0, canaryPos - 220), Math.min(originalBundle.length, canaryPos + 220))
+    : 'no .namespaces.canary marker in bundle';
+  fail(`Could not identify one unique compiled MCP write gate; found ${matches.length}. Context: ${context}`);
 }
 
 const match = matches[0];
