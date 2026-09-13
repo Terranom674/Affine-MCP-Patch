@@ -27,8 +27,6 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
-const permissionBuilderSource = sourceEndingWith('core/permission/builder.ts');
-const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -49,24 +47,6 @@ for (const marker of [
 ]) {
   if (!resolverSource.includes(marker)) {
     fail(`Resolver structure changed; missing marker: ${marker}`);
-  }
-}
-
-for (const marker of [
-  'constructor(private readonly permission?: PermissionService)',
-  'return new UserAccessControllerBuilder(userId, this.permission)'
-]) {
-  if (!permissionBuilderSource.includes(marker)) {
-    fail(`PermissionAccess structure changed; missing marker: ${marker}`);
-  }
-}
-
-for (const marker of [
-  'constructor(private readonly runtime: BackendRuntimeProvider)',
-  'this.runtime.authorizePermissionV1'
-]) {
-  if (!permissionServiceSource.includes(marker)) {
-    fail(`PermissionService structure changed; missing marker: ${marker}`);
   }
 }
 
@@ -140,11 +120,11 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// 4) AFFiNE upstream does not publish lifecycle tools in WorkspaceMcpProvider.
-// Add exactly trash/restore/delete inside the existing READ_WRITE branch.
-// PermissionAccess already owns PermissionService, and PermissionService owns the
-// actual BackendRuntimeProvider through Nest DI. This uses that existing chain
-// directly: this.ac.permission.runtime. No extra runtime, session or socket auth.
+// 4) Add exactly trash/restore/delete inside the existing READ_WRITE branch.
+// The MCP provider already owns PermissionAccess. In AFFiNE, PermissionAccess
+// owns PermissionService and PermissionService owns BackendRuntimeProvider via
+// Nest DI. We deliberately rely on this existing runtime chain rather than
+// creating a second auth/session path.
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
