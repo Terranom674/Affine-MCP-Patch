@@ -27,8 +27,6 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
-const permissionBuilderSource = sourceEndingWith('core/permission/builder.ts');
-const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -50,24 +48,6 @@ for (const marker of [
 ]) {
   if (!resolverSource.includes(marker)) {
     fail(`Resolver structure changed; missing marker: ${marker}`);
-  }
-}
-
-for (const marker of [
-  'export class AccessControllerBuilder',
-  'return new UserAccessControllerBuilder(userId, this.permission)'
-]) {
-  if (!permissionBuilderSource.includes(marker)) {
-    fail(`PermissionAccess structure changed; missing marker: ${marker}`);
-  }
-}
-
-for (const marker of [
-  'export class PermissionService',
-  'this.runtime.authorizePermissionV1'
-]) {
-  if (!permissionServiceSource.includes(marker)) {
-    fail(`PermissionService structure changed; missing marker: ${marker}`);
   }
 }
 
@@ -138,32 +118,14 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// Discover the actual minified PermissionService runtime property from the
-// compiled authorizePermissionV1 call, then inject the delegate next to an
-// existing public method. Never assume the source property name survives bundling.
-const runtimeRefs = [...patchedBundle.matchAll(/(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(/g)];
-if (runtimeRefs.length !== 1) {
-  fail(`permission service runtime: expected exactly one compiled authorizePermissionV1 receiver, found ${runtimeRefs.length}.`);
-}
-const runtimeExpr = runtimeRefs[0][1];
+// Capture AFFiNE's real BackendRuntimeProvider singleton at an existing,
+// authenticated PermissionService call. We do not add methods to minified
+// classes and do not assume any private property name.
 applyUnique(
-  /async workspacePermissions\(([^)]*)\)\{/g,
-  m => `async executeDomainCommandV1(__affineMcpCommand){return await ${runtimeExpr}.executeDomainCommandV1(__affineMcpCommand)}async workspacePermissions(${m[1]}){`,
-  'permission service runtime delegate'
+  /(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(/g,
+  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1(`,
+  'backend runtime capture'
 );
-
-// Discover the actual minified PermissionAccess permission field from the
-// compiled user() factory call and reuse that exact receiver in the delegate.
-const accessUserMatches = [...patchedBundle.matchAll(/user\(([^)]*)\)\{return new ([A-Za-z_$][\w$]*)\(([^,()]+),(this\.[A-Za-z_$][\w$]*)\)\}/g)];
-if (accessUserMatches.length !== 1) {
-  fail(`permission access runtime: expected exactly one compiled user() factory, found ${accessUserMatches.length}.`);
-}
-const accessUserMatch = accessUserMatches[0];
-const permissionExpr = accessUserMatch[4];
-const accessUserIndex = accessUserMatch.index;
-const accessUserOriginal = accessUserMatch[0];
-const accessUserReplacement = `executeDomainCommandV1(__affineMcpCommand){return ${permissionExpr}.executeDomainCommandV1(__affineMcpCommand)}${accessUserOriginal}`;
-applyExactAt(accessUserIndex, accessUserOriginal, accessUserReplacement, 'permission access runtime delegate');
 
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
@@ -207,7 +169,7 @@ name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpResult=await this.ac.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
+execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpRuntime=globalThis.__affineMcpBackendRuntime;if(!__affineMcpRuntime||typeof __affineMcpRuntime.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE backend runtime is unavailable\");let __affineMcpResult=await __affineMcpRuntime.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
 }`;
 
 const injected = `;${toolsVar}.push(${[
@@ -249,7 +211,7 @@ for (const marker of [
   'restore_document',
   'delete_document',
   'apply_doc_lifecycle',
-  'executeDomainCommandV1',
+  '__affineMcpBackendRuntime',
   'Doc.Trash',
   'Doc.Restore',
   'Doc.Delete'
@@ -260,4 +222,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through compiled DI delegates.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the authenticated backend runtime.');
