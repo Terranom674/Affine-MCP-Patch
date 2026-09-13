@@ -86,6 +86,23 @@ function applyUnique(regex, replacer, label) {
   changes.push({ label, original, replacement });
 }
 
+function applyAll(regex, replacer, label) {
+  const matches = [...patchedBundle.matchAll(regex)];
+  if (matches.length < 1) {
+    fail(`${label}: expected at least one compiled match, found 0.`);
+  }
+  for (const m of [...matches].reverse()) {
+    const original = m[0];
+    const replacement = typeof replacer === 'function' ? replacer(m) : replacer;
+    if (!replacement || replacement === original) {
+      fail(`${label}: refusing no-op patch.`);
+    }
+    const index = m.index;
+    patchedBundle = patchedBundle.slice(0, index) + replacement + patchedBundle.slice(index + original.length);
+    changes.push({ label: `${label}#${index}`, original, replacement });
+  }
+}
+
 function applyExactAt(index, original, replacement, label) {
   if (index < 0 || patchedBundle.slice(index, index + original.length) !== original) {
     fail(`${label}: target fragment changed before patching.`);
@@ -118,13 +135,13 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// Capture only PermissionService.authorize(): its call is uniquely shaped as
-// runtime.authorizePermissionV1({version:1,...input}). Other AFFiNE services
-// also call authorizePermissionV1, so a global receiver match is incorrect.
-applyUnique(
-  /(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(\{version:1,\.\.\.([A-Za-z_$][\w$]*)\}\)/g,
-  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1({version:1,...${m[2]}})`,
-  'permission service backend runtime capture'
+// Several AFFiNE services hold the same BackendRuntimeProvider singleton and call
+// authorizePermissionV1 on it. Capture any/all simple service receivers instead
+// of depending on one exact minified PermissionService call shape.
+applyAll(
+  /(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(/g,
+  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1(`,
+  'backend runtime capture'
 );
 
 const metaMarker = 'update_document_meta';
@@ -182,8 +199,8 @@ applyExactAt(pushIndex, pushCall, pushCall + injected, 'document lifecycle tools
 let reconstructed = originalBundle;
 for (const change of changes) {
   const count = reconstructed.split(change.original).length - 1;
-  if (count !== 1) {
-    fail(`${change.label}: original fragment is not uniquely reconstructable.`);
+  if (count < 1) {
+    fail(`${change.label}: original fragment is not reconstructable.`);
   }
   reconstructed = reconstructed.replace(change.original, change.replacement);
 }
@@ -194,8 +211,8 @@ if (reconstructed !== patchedBundle) {
 let reversed = patchedBundle;
 for (const change of [...changes].reverse()) {
   const count = reversed.split(change.replacement).length - 1;
-  if (count !== 1) {
-    fail(`${change.label}: patched fragment is not uniquely reversible.`);
+  if (count < 1) {
+    fail(`${change.label}: patched fragment is not reversible.`);
   }
   reversed = reversed.replace(change.replacement, change.original);
 }
