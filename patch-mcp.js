@@ -27,7 +27,9 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
+const writerSource = sourceEndingWith('core/doc/writer.ts');
 const gatewaySource = sourceEndingWith('core/sync/gateway.ts');
+const workspaceAdapterSource = sourceEndingWith('core/doc/adapters/workspace.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -54,14 +56,32 @@ for (const marker of [
 }
 
 for (const marker of [
-  'BackendRuntimeProvider',
-  'private readonly runtime: BackendRuntimeProvider',
-  'executeDomainCommandV1',
-  "command: 'apply_doc_lifecycle'",
-  "lifecycle: 'trash' | 'restore' | 'delete'"
+  'private readonly storage: PgWorkspaceDocStorageAdapter',
+  'this.storage.getDoc(workspaceId, workspaceId)',
+  'this.storage.pushDocUpdates(',
+  'private emitDocUpdatesPushed('
+]) {
+  if (!writerSource.includes(marker)) {
+    fail(`DocWriter structure changed; missing marker: ${marker}`);
+  }
+}
+
+for (const marker of [
+  "@SubscribeMessage('space:delete-doc')",
+  "'Doc.Delete'",
+  'await adapter.delete(spaceId, docId)'
 ]) {
   if (!gatewaySource.includes(marker)) {
-    fail(`AFFiNE native lifecycle runtime is unavailable; missing gateway marker: ${marker}`);
+    fail(`Stable delete path changed; missing gateway marker: ${marker}`);
+  }
+}
+
+for (const marker of [
+  'async deleteDoc(_workspaceId: string, _docId: string)',
+  'return;'
+]) {
+  if (!workspaceAdapterSource.includes(marker)) {
+    fail(`Workspace delete adapter changed; missing marker: ${marker}`);
   }
 }
 
@@ -114,7 +134,7 @@ function applyExactAt(index, original, replacement, label) {
 const ident = '[A-Za-z_$][\\w$]*';
 const chain = `${ident}(?:\\.${ident})*`;
 
-// 1) Existing WRITE gates only.
+// Existing MCP READ_WRITE gates.
 applyUnique(
   new RegExp(`(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`, 'g'),
   m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\")`,
@@ -133,39 +153,7 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// 2) Find AFFiNE's own lifecycle runtime in SpaceSyncGateway.
-const lifecycleCalls = [...patchedBundle.matchAll(/(this\.[A-Za-z_$][\w$]*)\.executeDomainCommandV1\(\{command:[\"']apply_doc_lifecycle[\"']/g)];
-if (lifecycleCalls.length !== 1) {
-  fail(`AFFiNE lifecycle runtime: expected exactly one apply_doc_lifecycle call, found ${lifecycleCalls.length}.`);
-}
-const runtimeExpr = lifecycleCalls[0][1];
-const runtimeProp = runtimeExpr.slice('this.'.length);
-const lifecyclePos = lifecycleCalls[0].index;
-const constructorStart = patchedBundle.lastIndexOf('constructor(', lifecyclePos);
-if (constructorStart < 0 || lifecyclePos - constructorStart > 50000) {
-  fail('AFFiNE lifecycle runtime: gateway constructor could not be located safely.');
-}
-const constructorEnd = patchedBundle.indexOf('}', constructorStart);
-if (constructorEnd < 0 || constructorEnd > lifecyclePos) {
-  fail('AFFiNE lifecycle runtime: gateway constructor boundary is ambiguous.');
-}
-const constructorChunk = patchedBundle.slice(constructorStart, constructorEnd + 1);
-const runtimeAssignmentRegex = new RegExp(`this\\.${runtimeProp}=(${ident})`, 'g');
-const runtimeAssignments = [...constructorChunk.matchAll(runtimeAssignmentRegex)];
-if (runtimeAssignments.length !== 1) {
-  fail(`AFFiNE lifecycle runtime: expected one constructor assignment for ${runtimeExpr}, found ${runtimeAssignments.length}.`);
-}
-const runtimeAssignment = runtimeAssignments[0][0];
-const runtimeParam = runtimeAssignments[0][1];
-const runtimeAssignmentIndex = constructorStart + runtimeAssignments[0].index;
-applyExactAt(
-  runtimeAssignmentIndex,
-  runtimeAssignment,
-  `${runtimeAssignment},globalThis.__AFFINE_MCP_BACKEND_RUNTIME__=${runtimeExpr}`,
-  'capture AFFiNE lifecycle runtime'
-);
-
-// 3) Locate the authenticated MCP workspace context and the native write-tool push.
+// Locate the authenticated MCP workspace context and native write-tool push.
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -202,18 +190,21 @@ const toolsVar = pushMatch[1];
 const pushIndex = markerPos + pushMatch.index;
 const pushCall = pushMatch[0];
 
-// 4) Add only an MCP adapter. AFFiNE itself performs the lifecycle delete.
+// AFFiNE stable permanent-delete semantics:
+// WorkspaceImpl.removeDoc -> WorkspaceMetaImpl.removeDocMeta + DocImpl.remove.
+// That means removing the page from root meta.pages and the legacy subdoc from root spaces.
+// No custom database cleanup is performed because stable AFFiNE itself does not do that here.
 const deleteTool = `{
 name:\"delete_document\",
 title:\"Delete Document\",
-description:\"Permanently delete a document using AFFiNE's native document lifecycle. This cannot be undone.\",
+description:\"Permanently delete a document using AFFiNE stable's own removeDoc semantics. This cannot be undone.\",
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The ID of the document to delete\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};if(__affineMcpDocId===${workspaceVar})return{isError:true,content:[{type:\"text\",text:\"Workspace root document cannot be deleted\"}]};try{let __affineMcpAccessible=await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).can(\"Doc.Delete\");if(!__affineMcpAccessible)return{isError:true,content:[{type:\"text\",text:\"Doc with id \"+__affineMcpDocId+\" not found.\"}]};if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpRuntime=globalThis.__AFFINE_MCP_BACKEND_RUNTIME__;if(!__affineMcpRuntime||typeof __affineMcpRuntime.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE native lifecycle runtime is unavailable\");await __affineMcpRuntime.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:\"delete\"});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,message:\"Document deleted successfully by AFFiNE lifecycle\"})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:\"Failed to delete document: \"+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
+execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};if(__affineMcpDocId===${workspaceVar})return{isError:true,content:[{type:\"text\",text:\"Workspace root document cannot be deleted\"}]};try{let __affineMcpAccessible=await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).can(\"Doc.Delete\");if(!__affineMcpAccessible)return{isError:true,content:[{type:\"text\",text:\"Doc with id \"+__affineMcpDocId+\" not found.\"}]};if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpWriter=this.writer;if(!__affineMcpWriter||!__affineMcpWriter.storage||typeof __affineMcpWriter.storage.getDoc!==\"function\"||typeof __affineMcpWriter.storage.pushDocUpdates!==\"function\")throw new Error(\"AFFiNE DocWriter storage is unavailable\");let __affineMcpRoot=await __affineMcpWriter.storage.getDoc(${workspaceVar},${workspaceVar});if(!__affineMcpRoot||!__affineMcpRoot.bin)throw new Error(\"Workspace root document is unavailable\");let __affineMcpY=require(\"/opt/affine-mcp-patch/node_modules/yjs\");let __affineMcpRootBin=Buffer.isBuffer(__affineMcpRoot.bin)?__affineMcpRoot.bin:Buffer.from(__affineMcpRoot.bin.buffer,__affineMcpRoot.bin.byteOffset,__affineMcpRoot.bin.byteLength);let __affineMcpYDoc=new __affineMcpY.Doc();__affineMcpY.applyUpdate(__affineMcpYDoc,__affineMcpRootBin);let __affineMcpMeta=__affineMcpYDoc.getMap(\"meta\");let __affineMcpPages=__affineMcpMeta.get(\"pages\");if(!__affineMcpPages||typeof __affineMcpPages.toArray!==\"function\"||typeof __affineMcpPages.delete!==\"function\")throw new Error(\"AFFiNE workspace meta.pages is unavailable\");let __affineMcpItems=__affineMcpPages.toArray();let __affineMcpIndex=-1;for(let __affineMcpI=0;__affineMcpI<__affineMcpItems.length;__affineMcpI++){let __affineMcpItem=__affineMcpItems[__affineMcpI];let __affineMcpItemId=__affineMcpItem&&typeof __affineMcpItem.get===\"function\"?__affineMcpItem.get(\"id\"):__affineMcpItem&&__affineMcpItem.id;if(__affineMcpItemId===__affineMcpDocId){__affineMcpIndex=__affineMcpI;break}}if(__affineMcpIndex<0)return{isError:true,content:[{type:\"text\",text:\"Doc with id \"+__affineMcpDocId+\" not found.\"}]};let __affineMcpState=__affineMcpY.encodeStateVector(__affineMcpYDoc);__affineMcpYDoc.transact(()=>{__affineMcpPages.delete(__affineMcpIndex,1);let __affineMcpSpaces=__affineMcpYDoc.getMap(\"spaces\");if(__affineMcpSpaces&&typeof __affineMcpSpaces.delete===\"function\")__affineMcpSpaces.delete(__affineMcpDocId)},__affineMcpYDoc.clientID);let __affineMcpUpdate=__affineMcpY.encodeStateAsUpdate(__affineMcpYDoc,__affineMcpState);if(!__affineMcpUpdate||__affineMcpUpdate.length===0)throw new Error(\"AFFiNE removeDoc produced no root update\");if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpTimestamp=await __affineMcpWriter.storage.pushDocUpdates(${workspaceVar},${workspaceVar},[__affineMcpUpdate],${userVar});if(typeof __affineMcpWriter.emitDocUpdatesPushed===\"function\")__affineMcpWriter.emitDocUpdatesPushed({spaceId:${workspaceVar},docId:${workspaceVar},updates:[__affineMcpUpdate],timestamp:__affineMcpTimestamp,editor:${userVar}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,message:\"Document deleted using AFFiNE stable removeDoc semantics\"})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:\"Failed to delete document: \"+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
 }`;
 
 applyExactAt(pushIndex, pushCall, `${pushCall};${toolsVar}.push(${deleteTool})`, 'delete_document adapter');
 
-// 5) Hard verification. Nothing outside the recorded changes may differ.
+// Hard verification. Nothing outside the recorded changes may differ.
 let reconstructed = originalBundle;
 for (const change of changes) {
   const count = reconstructed.split(change.original).length - 1;
@@ -244,8 +235,9 @@ for (const marker of [
   'update_document_meta',
   'delete_document',
   'Doc.Delete',
-  'apply_doc_lifecycle',
-  '__AFFINE_MCP_BACKEND_RUNTIME__'
+  '/opt/affine-mcp-patch/node_modules/yjs',
+  'meta.pages',
+  'removeDoc'
 ]) {
   if (!patchedBundle.includes(marker)) {
     fail(`Required marker disappeared: ${marker}`);
@@ -253,4 +245,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled MCP WRITE gates and added delete_document as a fail-closed adapter to AFFiNE apply_doc_lifecycle.');
+console.log('[AFFiNE MCP Patch] Enabled MCP WRITE gates and added delete_document using AFFiNE stable removeDoc semantics.');
