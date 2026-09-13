@@ -1,31 +1,34 @@
 # AFFiNE MCP Patch
 
-Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images. Der Patch schaltet den vorhandenen READ_WRITE-MCP fuer Self-Hosted-Installationen frei und ergaenzt genau ein fehlendes Werkzeug: `delete_document`.
+Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images. Der Patch schaltet den vorhandenen READ_WRITE-MCP fuer Self-Hosted-Installationen frei und ergaenzt `delete_document` ausschliesslich als Adapter auf AFFiNEs eigene Lifecycle-Loeschlogik.
 
 ## Umfang
 
 Der bestehende WRITE-Gate wird nur um `AFFINE_MCP_WRITE_ENABLED=true` erweitert. Die nativen Werkzeuge `read_document`, `doc_search`, `create_document`, `update_document` und `update_document_meta` bleiben unveraendert.
 
-Zusaetzlich wird `delete_document` in denselben bereits authentifizierten READ_WRITE-MCP-Kontext aufgenommen. Der Aufruf verwendet die vorhandenen `userId`- und `workspaceId`-Werte und prueft vor jeder Aenderung ueber AFFiNE selbst `Doc.Delete`.
+`delete_document` verwendet denselben authentifizierten MCP-Kontext. Vor dem Aufruf wird ueber AFFiNE `Doc.Delete` geprueft. Anschliessend delegiert der MCP-Adapter die eigentliche Loeschung an AFFiNEs vorhandenen Backend-Runtime-Befehl:
 
-Beim Delete wird der Dokumenteintrag aus `meta.pages` des Workspace-Root-Dokuments entfernt und danach AFFiNEs vorhandenes `DocModel.delete(workspaceId, docId)` fuer Snapshots, Updates und Historien verwendet.
+```text
+BackendRuntimeProvider.executeDomainCommandV1
+  -> command: apply_doc_lifecycle
+  -> lifecycle: delete
+```
+
+Der Patch implementiert selbst keine Root-YDoc-, Snapshot-, History-, Grant- oder Datenbank-Loeschlogik.
 
 ## Fail closed
 
-Der Patch fuehrt vor jeder Aenderung harte Strukturpruefungen gegen Source Map und kompiliertes Bundle aus. Erwartet werden unter anderem:
+Der Patch akzeptiert nur einen AFFiNE-Core, in dem der offizielle Lifecycle-Pfad eindeutig vorhanden ist. Vor dem Schreiben von `dist/main.js` werden unter anderem geprueft:
 
 - genau ein Workspace-MCP-Provider und Resolver
-- die bekannten drei READ_WRITE-Gates
-- die unveraenderte `DocWriter`-/Workspace-Adapter-Struktur
-- die vorhandene `DocModel.delete()`-Implementierung
-- die vorhandene Permission-Builder-Struktur fuer `Doc.Delete`
-- genau ein passender Write-Tool-Push im MCP-Provider
+- die bekannten READ_WRITE-Gates
+- `BackendRuntimeProvider` im Sync-Gateway
+- genau ein `executeDomainCommandV1()`-Aufruf fuer `apply_doc_lifecycle`
+- der authentifizierte `userId`-/`workspaceId`-Kontext des MCP-Providers
+- genau ein passender Push der drei nativen Write-Tools
+- `Doc.Delete` vor dem Lifecycle-Aufruf
 
-Passt eine dieser Annahmen nicht exakt, bricht der Build ab. `main.js` wird erst nach allen Pruefungen geschrieben. Alle vorgenommenen Bundle-Aenderungen werden vor dem Schreiben vorwaerts und rueckwaerts rekonstruiert und muessen exakt aufgehen.
-
-## Yjs
-
-Fuer die gezielte Aenderung des Root-Dokuments installiert das Patch-Image `yjs@13.6.21` fest unter `/opt/affine-mcp-patch/node_modules/yjs`. Dadurch ist die verwendete Laufzeit nicht von zufaellig vorhandenen Node-Modulen des AFFiNE-Images abhaengig.
+Fehlt eine dieser Strukturen oder ist sie nicht eindeutig, bricht der Build ab. Es gibt keinen eigenen Delete-Fallback.
 
 ## Sicherheit
 
@@ -33,7 +36,7 @@ Fuer die gezielte Aenderung des Root-Dokuments installiert das Patch-Image `yjs@
 - bestehender `aff_mcp_v1...`-Credential bleibt der einzige Authentifizierungspfad
 - keine zusaetzlichen Logins, JWTs, Cookies oder Socket.IO-Pfade
 - Permission-Pruefung bleibt bei AFFiNE
-- kein Trash-/Restore-Patch
+- die eigentliche Loeschung bleibt bei AFFiNE
 - keine direkte Datenbankverbindung des Connectors
 - keine GitHub Actions
 - kein automatisches Deployment
@@ -61,4 +64,4 @@ environment:
 docker build --pull -t affine-mcp-patched .
 ```
 
-Aendert ein AFFiNE-Update die gepruefte Struktur, stoppt der Build und der Patch muss zuerst an den neuen Stable-Core angepasst werden.
+Wenn der verwendete Stable-Core `apply_doc_lifecycle` noch nicht enthaelt, stoppt der Build absichtlich. Der Patch ersetzt AFFiNEs Lifecycle-Implementierung nicht durch eigene Loeschlogik.
