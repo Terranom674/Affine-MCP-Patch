@@ -91,21 +91,21 @@ const chain = `${ident}(?:\\.${ident})*`;
 // 1) Provider: expose write tools when the explicit env switch is true.
 applyUnique(
   new RegExp(`(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`, 'g'),
-  m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\")`,
+  m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true")`,
   'provider write gate'
 );
 
 // 2) GraphQL capability flag: report READ_WRITE as available under the same switch.
 applyUnique(
   /mcpCredentialReadWriteAvailable\(\)\{return env\.dev\|\|env\.namespaces\.canary\}/g,
-  'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\"}',
+  'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true"}',
   'resolver availability gate'
 );
 
 // 3) GraphQL credential creation guard: do not reject READ_WRITE when switch is true.
 applyUnique(
   new RegExp(`(\\.accessMode\\s*===\\s*${chain}\\.READ_WRITE\\s*&&\\s*!env\\.dev\\s*&&\\s*!env\\.namespaces\\.canary)`, 'g'),
-  m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!==\"true\"`,
+  m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!=="true"`,
   'resolver credential creation gate'
 );
 
