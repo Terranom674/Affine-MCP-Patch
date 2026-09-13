@@ -1,66 +1,51 @@
 # AFFiNE MCP Patch
 
-Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images und schaltet gezielt die bereits vorhandenen MCP-Schreibfunktionen fuer Self-Hosted-Installationen frei, ohne `AFFINE_ENV=dev` zu setzen.
+Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images und schaltet den vorhandenen READ_WRITE-MCP fuer die Self-Hosted-Installation frei.
 
-## Harte Regel
+Zusaetzlich werden genau drei fehlende Dokument-Lifecycle-Werkzeuge in den bereits authentifizierten READ_WRITE-MCP-Kontext aufgenommen:
 
-Am AFFiNE-Core wird **nichts** geaendert ausser genau der vorhandenen MCP-Write-Bedingung.
+- `trash_document`
+- `restore_document`
+- `delete_document`
 
-Sinngemaess wird nur:
+AFFiNE upstream bietet diese drei Operationen bereits nativ ueber `BackendRuntimeProvider.executeDomainCommandV1()` mit dem Domain-Command `apply_doc_lifecycle` an, veroeffentlicht sie aber nicht als Workspace-MCP-Tools. Der Patch verwendet fuer die drei Werkzeuge genau diesen vorhandenen nativen Lifecycle-Pfad und dieselben Berechtigungsaktionen wie AFFiNEs Sync-Gateway (`Doc.Trash`, `Doc.Restore`, `Doc.Delete`).
 
-```ts
-accessMode === McpAccessMode.READ_WRITE &&
-(env.dev || env.namespaces.canary)
-```
+## Umfang des Patches
 
-zu:
+Der Patch aendert ausschliesslich den MCP-bezogenen Ausfuehrungspfad:
 
-```ts
-accessMode === McpAccessMode.READ_WRITE &&
-(
-  env.dev ||
-  env.namespaces.canary ||
-  process.env.AFFINE_MCP_WRITE_ENABLED === 'true'
-)
-```
+1. vorhandenen READ_WRITE-Gate fuer `AFFINE_MCP_WRITE_ENABLED=true` freischalten;
+2. GraphQL-Verfuegbarkeitsflag und Credential-Guard an denselben Schalter anpassen;
+3. die bereits von Nest erzeugte `BackendRuntimeProvider`-Instanz deterministisch fuer den MCP-Provider referenzierbar machen;
+4. exakt `trash_document`, `restore_document` und `delete_document` im vorhandenen READ_WRITE-Zweig registrieren.
 
-Alle bestehenden AFFiNE-Berechtigungspruefungen, Authentifizierung, DocWriter-Logik, GraphQL, Datenbanklogik, Migrationen und MCP-Tools bleiben unveraendert.
+Nicht geaendert werden Datenbankschema, Migrationen, Authentifizierungsmodell, Permission-Modell, DocWriter-Logik oder normale AFFiNE-API-Endpunkte.
 
-## Keine Versionsbindung
+## Authentifizierung und Berechtigungen
 
-Der Patch ist absichtlich nicht an eine konkrete AFFiNE-Version oder einen Bundle-Hash gebunden.
+Es gibt **keine zusaetzliche Benutzeranmeldung** fuer die Lifecycle-Werkzeuge.
 
-Bei jedem Build wird die tatsaechliche Struktur des verwendeten offiziellen AFFiNE-Images geprueft:
+Der vorhandene `aff_mcp_v1...`-Credential authentifiziert den Workspace-MCP. AFFiNE liefert dem MCP-Provider dabei bereits `userId`, `workspaceId` und `accessMode`. Vor jeder Lifecycle-Operation wird innerhalb dieses Kontextes die passende AFFiNE-Berechtigung geprueft. Danach wird AFFiNEs eigener nativer `apply_doc_lifecycle`-Befehl mit genau diesem Actor ausgefuehrt.
 
-1. `main.js.map` muss genau einen `plugins/copilot/mcp/provider.ts` enthalten.
-2. Der Provider muss weiterhin den bekannten `READ_WRITE`-Gate und die vorhandenen Schreibwerkzeuge enthalten.
-3. Im kompilierten Bundle muss dieser Gate genau einmal eindeutig gefunden werden.
-4. Nur diese eine Bedingung wird um `AFFINE_MCP_WRITE_ENABLED` erweitert.
-5. Danach wird bytegenau geprueft, dass der gesamte restliche Bundle-Inhalt unveraendert geblieben ist.
-6. Wenn die Struktur nicht mehr eindeutig passt, bricht der Build ab.
+Damit gelten fuer Trash, Restore und Delete dieselben Rechte wie im nativen AFFiNE-Sync-Pfad.
 
-## Sicherheitsprinzip
+## Fail-closed-Prinzip
 
-Der Patch arbeitet **fail closed**:
+Der Patch ist nicht an einen festen Bundle-Hash gebunden, prueft aber vor jeder Aenderung die erwartete Upstream-Struktur ueber `main.js.map` und eindeutige Marker im kompilierten Bundle.
 
-- offizielles `ghcr.io/toeverything/affine:stable` bleibt die Basis
-- keine feste AFFiNE-Version
-- keine Hash-Liste
-- keine Aenderungen an Auth, Permissions, DocWriter, GraphQL, Datenbank oder Migrationen
-- keine neuen MCP-Funktionen
-- keine automatische GitHub Action
-- kein automatisches Deployment
-- bei unklarer Upstream-Struktur: Build-Abbruch
+Der Build bricht ab, wenn unter anderem:
 
-## Dateien
+- der Workspace-MCP-Provider nicht mehr eindeutig gefunden wird;
+- der READ_WRITE-Gate seine Struktur geaendert hat;
+- `BackendRuntimeProvider.executeDomainCommandV1` nicht eindeutig vorhanden ist;
+- der vorhandene Write-Tool-Push nicht eindeutig gefunden wird;
+- eine aufgezeichnete Ersetzung nicht exakt reversibel ist.
 
-- `Dockerfile` - baut das angepasste Image aus dem aktuellen Upstream-Image
-- `patch-mcp.js` - erkennt und aendert ausschliesslich den MCP-Write-Gate
-- `compose.example.yml` - Beispiel fuer die Einbindung in Docker Compose
+Es werden keine GitHub Actions und kein automatisches Deployment eingerichtet.
 
 ## Aktivierung
 
-AFFiNE bleibt im Production-Namespace. Die Schreibfreigabe erfolgt separat:
+AFFiNE bleibt im Production-Namespace:
 
 ```yaml
 environment:
@@ -68,7 +53,25 @@ environment:
   AFFINE_MCP_WRITE_ENABLED: "true"
 ```
 
-Ohne `AFFINE_MCP_WRITE_ENABLED=true` verhaelt sich der gepatchte Gate wie der originale Production-Gate.
+## Erwartete Workspace-MCP-Werkzeuge
+
+Im READ_WRITE-Betrieb werden mindestens diese acht Dokumentwerkzeuge erwartet:
+
+- `read_document`
+- `doc_search`
+- `create_document`
+- `update_document`
+- `update_document_meta`
+- `trash_document`
+- `restore_document`
+- `delete_document`
+
+## Dateien
+
+- `Dockerfile` - baut das angepasste Image aus dem offiziellen Stable-Image
+- `patch-mcp.js` - fail-closed MCP-Write- und Lifecycle-Patch
+- `docker-compose.override.yml` - Produktions-Override der Self-Hosted-Installation
+- `deploy.sh` - manuell auszufuehrendes Deployment
 
 ## Build
 
@@ -76,4 +79,4 @@ Ohne `AFFINE_MCP_WRITE_ENABLED=true` verhaelt sich der gepatchte Gate wie der or
 docker build --pull -t affine-mcp-patched .
 ```
 
-Bei einem AFFiNE-Update wird derselbe Build erneut ausgefuehrt. Solange die relevante MCP-Struktur kompatibel bleibt, wird das neue Image gepatcht. Aendert AFFiNE diese Struktur, stoppt der Build und muss zuerst geprueft werden.
+Bei einem AFFiNE-Update wird derselbe Build erneut ausgefuehrt. Wenn die relevante MCP-/Runtime-Struktur nicht mehr eindeutig passt, stoppt der Build und muss zuerst geprueft werden.
