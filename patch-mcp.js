@@ -33,7 +33,8 @@ for (const marker of [
   'env.namespaces.canary',
   "name: 'create_document'",
   "name: 'update_document'",
-  "name: 'update_document_meta'"
+  "name: 'update_document_meta'",
+  "assert('Workspace.Read')"
 ]) {
   if (!providerSource.includes(marker)) {
     fail(`Provider structure changed; missing marker: ${marker}`);
@@ -57,7 +58,7 @@ if ((providerSource.match(providerGateSource) || []).length !== 1) {
 
 const availabilitySource = /mcpCredentialReadWriteAvailable\(\)\s*\{\s*return\s+env\.dev\s*\|\|\s*env\.namespaces\.canary;?\s*\}/gm;
 if ((resolverSource.match(availabilitySource) || []).length !== 1) {
-  fail('Expected exactly one READ_WRITE availability gate in resolver source.');
+  fail('Expected exactly one READ_WRITE availability gate in source.');
 }
 
 const creationGuardSource = /input\.accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*!env\.dev\s*&&\s*!env\.namespaces\.canary/gm;
@@ -99,32 +100,24 @@ function applyExactAt(index, original, replacement, label) {
 const ident = '[A-Za-z_$][\\w$]*';
 const chain = `${ident}(?:\\.${ident})*`;
 
-// 1) Provider: expose write tools when the explicit env switch is true.
 applyUnique(
   new RegExp(`(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`, 'g'),
   m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\")`,
   'provider write gate'
 );
 
-// 2) GraphQL capability flag: report READ_WRITE as available under the same switch.
 applyUnique(
   /mcpCredentialReadWriteAvailable\(\)\{return env\.dev\|\|env\.namespaces\.canary\}/g,
   'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\"}',
   'resolver availability gate'
 );
 
-// 3) GraphQL credential creation guard: do not reject READ_WRITE when switch is true.
 applyUnique(
   new RegExp(`(\\.accessMode\\s*===\\s*${chain}\\.READ_WRITE\\s*&&\\s*!env\\.dev\\s*&&\\s*!env\\.namespaces\\.canary)`, 'g'),
   m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!==\"true\"`,
   'resolver credential creation gate'
 );
 
-// 4) Add exactly trash/restore/delete inside the existing READ_WRITE branch.
-// The MCP provider already owns PermissionAccess. In AFFiNE, PermissionAccess
-// owns PermissionService and PermissionService owns BackendRuntimeProvider via
-// Nest DI. We deliberately rely on this existing runtime chain rather than
-// creating a second auth/session path.
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -135,16 +128,19 @@ if (metaPositions.length !== 1) {
 }
 const markerPos = metaPositions[0];
 
-const forMatches = [...patchedBundle.slice(0, markerPos).matchAll(/async\s+for\(([^)]*)\)\{/g)];
-if (!forMatches.length) {
-  fail('document lifecycle tools: could not locate compiled WorkspaceMcpProvider.for signature.');
+// Resolve the authenticated MCP context from AFFiNE's own compiled permission
+// check instead of guessing the enclosing method parameter list. This uniquely
+// identifies the real user/workspace variables used by WorkspaceMcpProvider.
+const contextStart = Math.max(0, markerPos - 20000);
+const contextChunk = patchedBundle.slice(contextStart, markerPos);
+const contextMatches = [...contextChunk.matchAll(/\.user\(([^()]+)\)\.workspace\(([^()]+)\)\.assert\((['\"])Workspace\.Read\3\)/g)];
+if (contextMatches.length !== 1) {
+  fail(`document lifecycle tools: expected one compiled Workspace.Read context before ${metaMarker}, found ${contextMatches.length}.`);
 }
-const forMatch = forMatches[forMatches.length - 1];
-const rawParams = forMatch[1].split(',').map(value => value.trim());
-const userVar = (rawParams[0] || '').match(/^([A-Za-z_$][\w$]*)/)?.[1];
-const workspaceVar = (rawParams[1] || '').match(/^([A-Za-z_$][\w$]*)/)?.[1];
-if (!userVar || !workspaceVar) {
-  fail('document lifecycle tools: could not resolve user/workspace variables from compiled provider signature.');
+const userVar = contextMatches[0][1].trim();
+const workspaceVar = contextMatches[0][2].trim();
+if (!new RegExp(`^${ident}$`).test(userVar) || !new RegExp(`^${ident}$`).test(workspaceVar)) {
+  fail(`document lifecycle tools: unexpected user/workspace expressions: ${userVar} / ${workspaceVar}`);
 }
 
 const searchEnd = Math.min(patchedBundle.length, markerPos + 10000);
@@ -177,7 +173,6 @@ const injected = `;${toolsVar}.push(${[
 ].join(',')})`;
 applyExactAt(pushIndex, pushCall, pushCall + injected, 'document lifecycle tools');
 
-// Hard verification: only explicitly recorded substitutions are allowed.
 let reconstructed = originalBundle;
 for (const change of changes) {
   const count = reconstructed.split(change.original).length - 1;
@@ -220,4 +215,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the existing permission runtime.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the authenticated MCP context.');
