@@ -27,7 +27,6 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
-const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -50,10 +49,6 @@ for (const marker of [
   if (!resolverSource.includes(marker)) {
     fail(`Resolver structure changed; missing marker: ${marker}`);
   }
-}
-
-if (!permissionServiceSource.includes('this.runtime.authorizePermissionV1')) {
-  fail('PermissionService structure changed; runtime authorization call not found in source map.');
 }
 
 const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
@@ -201,12 +196,13 @@ function generatedOffsetForOriginal(sourceSuffix, needle) {
   return lineStarts[best.generatedLine] + best.generatedColumn;
 }
 
-// Locate PermissionService's runtime call through the source map, then patch only
-// the nearest generated authorizePermissionV1 receiver. This avoids guessing
-// minified property names or requiring authorizePermissionV1 to be globally unique.
+// Locate PermissionService's authorization call through the source map without
+// assuming the source-level DI property is named "runtime". Only the stable
+// method name is used as the source anchor; the generated receiver is then
+// discovered next to that mapping.
 const permissionRuntimeOffset = generatedOffsetForOriginal(
   'core/permission/service.ts',
-  'this.runtime.authorizePermissionV1'
+  '.authorizePermissionV1'
 );
 const permissionWindowStart = Math.max(0, permissionRuntimeOffset - 1200);
 const permissionWindowEnd = Math.min(patchedBundle.length, permissionRuntimeOffset + 1200);
