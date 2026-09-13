@@ -27,6 +27,7 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
+const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -49,6 +50,10 @@ for (const marker of [
   if (!resolverSource.includes(marker)) {
     fail(`Resolver structure changed; missing marker: ${marker}`);
   }
+}
+
+if (!permissionServiceSource.includes('this.runtime.authorizePermissionV1')) {
+  fail('PermissionService structure changed; runtime authorization call not found in source map.');
 }
 
 const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
@@ -86,23 +91,6 @@ function applyUnique(regex, replacer, label) {
   changes.push({ label, original, replacement });
 }
 
-function applyAll(regex, replacer, label) {
-  const matches = [...patchedBundle.matchAll(regex)];
-  if (matches.length < 1) {
-    fail(`${label}: expected at least one compiled match, found 0.`);
-  }
-  for (const m of [...matches].reverse()) {
-    const original = m[0];
-    const replacement = typeof replacer === 'function' ? replacer(m) : replacer;
-    if (!replacement || replacement === original) {
-      fail(`${label}: refusing no-op patch.`);
-    }
-    const index = m.index;
-    patchedBundle = patchedBundle.slice(0, index) + replacement + patchedBundle.slice(index + original.length);
-    changes.push({ label: `${label}#${index}`, original, replacement });
-  }
-}
-
 function applyExactAt(index, original, replacement, label) {
   if (index < 0 || patchedBundle.slice(index, index + original.length) !== original) {
     fail(`${label}: target fragment changed before patching.`);
@@ -135,15 +123,119 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// Capture the real BackendRuntimeProvider from existing authorization calls.
-// The lifecycle permission assert runs immediately before the command, so this
-// capture is refreshed on the same authenticated request path that invokes the
-// lifecycle tool. Do not rely on private PermissionAccess/PermissionService
-// fields or constructor shapes.
-applyAll(
-  /((?:this\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.authorizePermissionV1\(/g,
-  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1(`,
-  'backend runtime capture'
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function decodeVlq(segment) {
+  const values = [];
+  let value = 0;
+  let shift = 0;
+  for (const ch of segment) {
+    const digit = BASE64.indexOf(ch);
+    if (digit < 0) fail(`Invalid source-map VLQ character: ${ch}`);
+    const continuation = digit & 32;
+    value += (digit & 31) << shift;
+    if (continuation) {
+      shift += 5;
+      continue;
+    }
+    const negative = value & 1;
+    value >>= 1;
+    values.push(negative ? -value : value);
+    value = 0;
+    shift = 0;
+  }
+  if (shift !== 0) fail('Unterminated source-map VLQ segment.');
+  return values;
+}
+
+function generatedOffsetForOriginal(sourceSuffix, needle) {
+  const sourceMatches = map.sources
+    .map((source, index) => ({ source, index }))
+    .filter(({ source }) => source.endsWith(sourceSuffix));
+  if (sourceMatches.length !== 1) {
+    fail(`Source-map locator: expected one ${sourceSuffix}, found ${sourceMatches.length}.`);
+  }
+  const sourceIndex = sourceMatches[0].index;
+  const source = map.sourcesContent?.[sourceIndex] || '';
+  const pos = source.indexOf(needle);
+  if (pos < 0) fail(`Source-map locator: needle not found in ${sourceSuffix}: ${needle}`);
+  const before = source.slice(0, pos);
+  const originalLine = (before.match(/\n/g) || []).length;
+  const lastNl = before.lastIndexOf('\n');
+  const originalColumn = pos - (lastNl + 1);
+
+  let previousSource = 0;
+  let previousOriginalLine = 0;
+  let previousOriginalColumn = 0;
+  let previousName = 0;
+  let best = null;
+  const mappingLines = map.mappings.split(';');
+
+  for (let generatedLine = 0; generatedLine < mappingLines.length; generatedLine++) {
+    let generatedColumn = 0;
+    const segments = mappingLines[generatedLine].split(',');
+    for (const segment of segments) {
+      if (!segment) continue;
+      const values = decodeVlq(segment);
+      generatedColumn += values[0];
+      if (values.length >= 4) {
+        previousSource += values[1];
+        previousOriginalLine += values[2];
+        previousOriginalColumn += values[3];
+        if (values.length >= 5) previousName += values[4];
+        if (previousSource === sourceIndex) {
+          const distance = Math.abs(previousOriginalLine - originalLine) * 100000 + Math.abs(previousOriginalColumn - originalColumn);
+          if (!best || distance < best.distance) {
+            best = { generatedLine, generatedColumn, distance };
+          }
+        }
+      }
+    }
+  }
+
+  if (!best) fail(`Source-map locator: no generated mapping found for ${sourceSuffix}.`);
+  const lineStarts = [0];
+  for (let i = 0; i < patchedBundle.length; i++) {
+    if (patchedBundle.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  }
+  if (best.generatedLine >= lineStarts.length) fail('Source-map locator: generated line exceeds bundle length.');
+  return lineStarts[best.generatedLine] + best.generatedColumn;
+}
+
+// Locate PermissionService's runtime call through the source map, then patch only
+// the nearest generated authorizePermissionV1 receiver. This avoids guessing
+// minified property names or requiring authorizePermissionV1 to be globally unique.
+const permissionRuntimeOffset = generatedOffsetForOriginal(
+  'core/permission/service.ts',
+  'this.runtime.authorizePermissionV1'
+);
+const permissionWindowStart = Math.max(0, permissionRuntimeOffset - 1200);
+const permissionWindowEnd = Math.min(patchedBundle.length, permissionRuntimeOffset + 1200);
+const permissionWindow = patchedBundle.slice(permissionWindowStart, permissionWindowEnd);
+const permissionCandidates = [...permissionWindow.matchAll(/((?:this\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.authorizePermissionV1\(/g)];
+if (permissionCandidates.length < 1) {
+  fail('PermissionService runtime capture: no authorizePermissionV1 receiver near source-map location.');
+}
+let permissionCandidate = null;
+let permissionDistance = Infinity;
+for (const candidate of permissionCandidates) {
+  const absoluteIndex = permissionWindowStart + candidate.index;
+  const distance = Math.abs(absoluteIndex - permissionRuntimeOffset);
+  if (distance < permissionDistance) {
+    permissionDistance = distance;
+    permissionCandidate = { match: candidate, absoluteIndex };
+  }
+}
+if (!permissionCandidate || permissionDistance > 1200) {
+  fail('PermissionService runtime capture: nearest authorizePermissionV1 receiver is outside expected source-map window.');
+}
+const permissionOriginal = permissionCandidate.match[0];
+const permissionReceiver = permissionCandidate.match[1];
+const permissionReplacement = `(globalThis.__affineMcpBackendRuntime=${permissionReceiver}).authorizePermissionV1(`;
+applyExactAt(
+  permissionCandidate.absoluteIndex,
+  permissionOriginal,
+  permissionReplacement,
+  'permission service backend runtime capture'
 );
 
 const metaMarker = 'update_document_meta';
@@ -217,4 +309,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the authenticated backend runtime.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through source-map-located PermissionService runtime.');
