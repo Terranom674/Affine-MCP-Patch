@@ -27,6 +27,8 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
+const writerSource = sourceEndingWith('core/doc/writer.ts');
+const docModelSource = sourceEndingWith('models/doc.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -51,19 +53,26 @@ for (const marker of [
   }
 }
 
-const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
-if ((providerSource.match(providerGateSource) || []).length !== 1) {
-  fail('Expected exactly one provider READ_WRITE gate in source.');
+for (const marker of [
+  'PgWorkspaceDocStorageAdapter',
+  'pushDocUpdates(',
+  'getDoc(workspaceId, workspaceId)',
+  'emitDocUpdatesPushed'
+]) {
+  if (!writerSource.includes(marker)) {
+    fail(`DocWriter structure changed; missing marker: ${marker}`);
+  }
 }
 
-const availabilitySource = /mcpCredentialReadWriteAvailable\(\)\s*\{\s*return\s+env\.dev\s*\|\|\s*env\.namespaces\.canary;?\s*\}/gm;
-if ((resolverSource.match(availabilitySource) || []).length !== 1) {
-  fail('Expected exactly one READ_WRITE availability gate in resolver source.');
-}
-
-const creationGuardSource = /input\.accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*!env\.dev\s*&&\s*!env\.namespaces\.canary/gm;
-if ((resolverSource.match(creationGuardSource) || []).length !== 1) {
-  fail('Expected exactly one READ_WRITE credential creation guard in source.');
+for (const marker of [
+  'async delete(workspaceId: string, docId: string)',
+  'snapshot.deleteMany',
+  'update.deleteMany',
+  'snapshotHistory.deleteMany'
+]) {
+  if (!docModelSource.includes(marker)) {
+    fail(`DocModel structure changed; missing marker: ${marker}`);
+  }
 }
 
 const originalBundle = fs.readFileSync(bundlePath, 'utf8');
@@ -118,122 +127,6 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-function decodeVlq(segment) {
-  const values = [];
-  let value = 0;
-  let shift = 0;
-  for (const ch of segment) {
-    const digit = BASE64.indexOf(ch);
-    if (digit < 0) fail(`Invalid source-map VLQ character: ${ch}`);
-    const continuation = digit & 32;
-    value += (digit & 31) << shift;
-    if (continuation) {
-      shift += 5;
-      continue;
-    }
-    const negative = value & 1;
-    value >>= 1;
-    values.push(negative ? -value : value);
-    value = 0;
-    shift = 0;
-  }
-  if (shift !== 0) fail('Unterminated source-map VLQ segment.');
-  return values;
-}
-
-function generatedOffsetForOriginal(sourceSuffix, needle) {
-  const sourceMatches = map.sources
-    .map((source, index) => ({ source, index }))
-    .filter(({ source }) => source.endsWith(sourceSuffix));
-  if (sourceMatches.length !== 1) {
-    fail(`Source-map locator: expected one ${sourceSuffix}, found ${sourceMatches.length}.`);
-  }
-  const sourceIndex = sourceMatches[0].index;
-  const source = map.sourcesContent?.[sourceIndex] || '';
-  const pos = source.indexOf(needle);
-  if (pos < 0) fail(`Source-map locator: needle not found in ${sourceSuffix}: ${needle}`);
-  const before = source.slice(0, pos);
-  const originalLine = (before.match(/\n/g) || []).length;
-  const lastNl = before.lastIndexOf('\n');
-  const originalColumn = pos - (lastNl + 1);
-
-  let previousSource = 0;
-  let previousOriginalLine = 0;
-  let previousOriginalColumn = 0;
-  let previousName = 0;
-  let best = null;
-  const mappingLines = map.mappings.split(';');
-
-  for (let generatedLine = 0; generatedLine < mappingLines.length; generatedLine++) {
-    let generatedColumn = 0;
-    const segments = mappingLines[generatedLine].split(',');
-    for (const segment of segments) {
-      if (!segment) continue;
-      const values = decodeVlq(segment);
-      generatedColumn += values[0];
-      if (values.length >= 4) {
-        previousSource += values[1];
-        previousOriginalLine += values[2];
-        previousOriginalColumn += values[3];
-        if (values.length >= 5) previousName += values[4];
-        if (previousSource === sourceIndex) {
-          const distance = Math.abs(previousOriginalLine - originalLine) * 100000 + Math.abs(previousOriginalColumn - originalColumn);
-          if (!best || distance < best.distance) {
-            best = { generatedLine, generatedColumn, distance };
-          }
-        }
-      }
-    }
-  }
-
-  if (!best) fail(`Source-map locator: no generated mapping found for ${sourceSuffix}.`);
-  const lineStarts = [0];
-  for (let i = 0; i < patchedBundle.length; i++) {
-    if (patchedBundle.charCodeAt(i) === 10) lineStarts.push(i + 1);
-  }
-  if (best.generatedLine >= lineStarts.length) fail('Source-map locator: generated line exceeds bundle length.');
-  return lineStarts[best.generatedLine] + best.generatedColumn;
-}
-
-// Locate PermissionService's authorization call through the source map without
-// assuming the source-level DI property is named "runtime". Only the stable
-// method name is used as the source anchor; the generated receiver is then
-// discovered next to that mapping.
-const permissionRuntimeOffset = generatedOffsetForOriginal(
-  'core/permission/service.ts',
-  '.authorizePermissionV1'
-);
-const permissionWindowStart = Math.max(0, permissionRuntimeOffset - 1200);
-const permissionWindowEnd = Math.min(patchedBundle.length, permissionRuntimeOffset + 1200);
-const permissionWindow = patchedBundle.slice(permissionWindowStart, permissionWindowEnd);
-const permissionCandidates = [...permissionWindow.matchAll(/((?:this\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.authorizePermissionV1\(/g)];
-if (permissionCandidates.length < 1) {
-  fail('PermissionService runtime capture: no authorizePermissionV1 receiver near source-map location.');
-}
-let permissionCandidate = null;
-let permissionDistance = Infinity;
-for (const candidate of permissionCandidates) {
-  const absoluteIndex = permissionWindowStart + candidate.index;
-  const distance = Math.abs(absoluteIndex - permissionRuntimeOffset);
-  if (distance < permissionDistance) {
-    permissionDistance = distance;
-    permissionCandidate = { match: candidate, absoluteIndex };
-  }
-}
-if (!permissionCandidate || permissionDistance > 1200) {
-  fail('PermissionService runtime capture: nearest authorizePermissionV1 receiver is outside expected source-map window.');
-}
-const permissionOriginal = permissionCandidate.match[0];
-const permissionReceiver = permissionCandidate.match[1];
-const permissionReplacement = `(globalThis.__affineMcpBackendRuntime=${permissionReceiver}).authorizePermissionV1(`;
-applyExactAt(
-  permissionCandidate.absoluteIndex,
-  permissionOriginal,
-  permissionReplacement,
-  'permission service backend runtime capture'
-);
-
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -271,20 +164,84 @@ const toolsVar = pushMatch[1];
 const pushIndex = markerPos + pushMatch.index;
 const pushCall = pushMatch[0];
 
-const lifecycleTool = (name, title, lifecycle, permission, description) => `{
+// Stable 0.27.x does not expose the newer native apply_doc_lifecycle runtime command.
+// Backport lifecycle semantics directly through the server's existing stable services:
+// - mutate root meta.pages with Yjs through DocWriter's existing storage path
+// - permanently remove document data through stable DocModel.delete + related models
+const lifecyclePrelude = `
+let __affineMcpY;try{__affineMcpY=require(\"yjs\")}catch(__affineMcpYError){throw new Error(\"AFFiNE stable lifecycle backport requires yjs\")}
+let __affineMcpWriter=this.writer;
+if(!__affineMcpWriter||!__affineMcpWriter.storage)throw new Error(\"AFFiNE DocWriter storage is unavailable\");
+let __affineMcpModels=__affineMcpWriter.storage.models;
+if(!__affineMcpModels||!__affineMcpModels.doc)throw new Error(\"AFFiNE Models are unavailable\");
+let __affineMcpRoot=await __affineMcpWriter.storage.getDoc(${workspaceVar},${workspaceVar});
+if(!__affineMcpRoot||!__affineMcpRoot.bin)throw new Error(\"Workspace root document is unavailable\");
+let __affineMcpRootBin=Buffer.isBuffer(__affineMcpRoot.bin)?__affineMcpRoot.bin:Buffer.from(__affineMcpRoot.bin.buffer,__affineMcpRoot.bin.byteOffset,__affineMcpRoot.bin.byteLength);
+let __affineMcpYDoc=new __affineMcpY.Doc();__affineMcpY.applyUpdate(__affineMcpYDoc,__affineMcpRootBin);
+let __affineMcpMeta=__affineMcpYDoc.getMap(\"meta\");let __affineMcpPages=__affineMcpMeta.get(\"pages\");
+if(!__affineMcpPages||typeof __affineMcpPages.toArray!==\"function\")throw new Error(\"Workspace root meta.pages is unavailable\");
+let __affineMcpPageIndex=-1;let __affineMcpPage=null;let __affineMcpPageItems=__affineMcpPages.toArray();
+for(let __affineMcpI=0;__affineMcpI<__affineMcpPageItems.length;__affineMcpI++){let __affineMcpCandidate=__affineMcpPageItems[__affineMcpI];let __affineMcpCandidateId=__affineMcpCandidate&&typeof __affineMcpCandidate.get===\"function\"?__affineMcpCandidate.get(\"id\"):__affineMcpCandidate&&__affineMcpCandidate.id;if(__affineMcpCandidateId===__affineMcpDocId){__affineMcpPageIndex=__affineMcpI;__affineMcpPage=__affineMcpCandidate;break}}
+if(__affineMcpPageIndex<0||!__affineMcpPage)throw new Error(\"Document is not registered in workspace root\");
+`;
+
+const mutateRoot = mutation => `${lifecyclePrelude}
+let __affineMcpStateVector=__affineMcpY.encodeStateVector(__affineMcpYDoc);
+${mutation}
+let __affineMcpRootUpdate=__affineMcpY.encodeStateAsUpdate(__affineMcpYDoc,__affineMcpStateVector);
+let __affineMcpTimestamp=await __affineMcpWriter.storage.pushDocUpdates(${workspaceVar},${workspaceVar},[__affineMcpRootUpdate],${userVar});
+if(typeof __affineMcpWriter.emitDocUpdatesPushed===\"function\")__affineMcpWriter.emitDocUpdatesPushed({spaceId:${workspaceVar},docId:${workspaceVar},updates:[__affineMcpRootUpdate],timestamp:__affineMcpTimestamp,editor:${userVar}});
+`;
+
+const lifecycleTool = (name, title, permission, description, body) => `{
 name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpRuntime=globalThis.__affineMcpBackendRuntime;if(!__affineMcpRuntime||typeof __affineMcpRuntime.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE backend runtime is unavailable\");let __affineMcpResult=await __affineMcpRuntime.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
+execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};if(__affineMcpDocId===${workspaceVar})return{isError:true,content:[{type:\"text\",text:\"Workspace root document cannot be lifecycle-managed\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});${body}return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${name.replace('_document','')} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
 }`;
 
+const trashBody = mutateRoot(`if(typeof __affineMcpPage.set!==\"function\")throw new Error(\"Workspace root page entry is not mutable\");__affineMcpPage.set(\"trash\",true);__affineMcpPage.set(\"trashDate\",Date.now());`);
+const restoreBody = mutateRoot(`if(typeof __affineMcpPage.set!==\"function\")throw new Error(\"Workspace root page entry is not mutable\");__affineMcpPage.set(\"trash\",false);if(typeof __affineMcpPage.delete===\"function\")__affineMcpPage.delete(\"trashDate\");else __affineMcpPage.set(\"trashDate\",undefined);`);
+const deleteBody = `${mutateRoot(`__affineMcpPages.delete(__affineMcpPageIndex,1);`)}
+await __affineMcpModels.comment.db.reply.deleteMany({where:{workspaceId:${workspaceVar},docId:__affineMcpDocId}});
+await __affineMcpModels.comment.db.comment.deleteMany({where:{workspaceId:${workspaceVar},docId:__affineMcpDocId}});
+await __affineMcpModels.docGrant.db.docGrant.deleteMany({where:{workspaceId:${workspaceVar},docId:__affineMcpDocId}});
+await __affineMcpModels.docAccessPolicy.db.docAccessPolicy.deleteMany({where:{workspaceId:${workspaceVar},docId:__affineMcpDocId}});
+await __affineMcpModels.doc.db.workspaceDoc.deleteMany({where:{workspaceId:${workspaceVar},docId:__affineMcpDocId}});
+await __affineMcpModels.doc.delete(${workspaceVar},__affineMcpDocId);
+`;
+
 const injected = `;${toolsVar}.push(${[
-  lifecycleTool('trash_document', 'Trash Document', 'trash', 'Doc.Trash', 'Move a document to the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('restore_document', 'Restore Document', 'restore', 'Doc.Restore', 'Restore a document from the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('delete_document', 'Delete Document', 'delete', 'Doc.Delete', 'Permanently delete a document using AFFiNE native document lifecycle handling. This cannot be undone.'),
+  lifecycleTool('trash_document', 'Trash Document', 'Doc.Trash', 'Move a document to the AFFiNE trash using the Stable document metadata format.', trashBody),
+  lifecycleTool('restore_document', 'Restore Document', 'Doc.Restore', 'Restore a document from the AFFiNE trash using the Stable document metadata format.', restoreBody),
+  lifecycleTool('delete_document', 'Delete Document', 'Doc.Delete', 'Permanently delete a document and its Stable server-side document data. This cannot be undone.', deleteBody),
 ].join(',')})`;
 applyExactAt(pushIndex, pushCall, pushCall + injected, 'document lifecycle tools');
+
+let reconstructed = originalBundle;
+for (const change of changes) {
+  const count = reconstructed.split(change.original).length - 1;
+  if (count !== 1) {
+    fail(`${change.label}: original fragment is not uniquely reconstructable.`);
+  }
+  reconstructed = reconstructed.replace(change.original, change.replacement);
+}
+if (reconstructed !== patchedBundle) {
+  fail('Bundle contains changes outside the recorded MCP patches.');
+}
+
+let reversed = patchedBundle;
+for (const change of [...changes].reverse()) {
+  const count = reversed.split(change.replacement).length - 1;
+  if (count !== 1) {
+    fail(`${change.label}: patched fragment is not uniquely reversible.`);
+  }
+  reversed = reversed.replace(change.replacement, change.original);
+}
+if (reversed !== originalBundle) {
+  fail('Patch is not exactly reversible to the upstream bundle.');
+}
 
 for (const marker of [
   'create_document',
@@ -293,8 +250,7 @@ for (const marker of [
   'trash_document',
   'restore_document',
   'delete_document',
-  'apply_doc_lifecycle',
-  '__affineMcpBackendRuntime',
+  'trashDate',
   'Doc.Trash',
   'Doc.Restore',
   'Doc.Delete'
@@ -305,4 +261,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through source-map-located PermissionService runtime.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and Stable trash/restore/delete lifecycle tools.');
