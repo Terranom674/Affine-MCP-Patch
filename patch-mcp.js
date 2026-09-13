@@ -27,7 +27,8 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
-const runtimeSource = sourceEndingWith('core/backend-runtime/provider.ts');
+const permissionBuilderSource = sourceEndingWith('core/permission/builder.ts');
+const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -51,8 +52,22 @@ for (const marker of [
   }
 }
 
-if (!runtimeSource.includes('executeDomainCommandV1')) {
-  fail('BackendRuntimeProvider structure changed; executeDomainCommandV1 is missing.');
+for (const marker of [
+  'constructor(private readonly permission?: PermissionService)',
+  'return new UserAccessControllerBuilder(userId, this.permission)'
+]) {
+  if (!permissionBuilderSource.includes(marker)) {
+    fail(`PermissionAccess structure changed; missing marker: ${marker}`);
+  }
+}
+
+for (const marker of [
+  'constructor(private readonly runtime: BackendRuntimeProvider)',
+  'this.runtime.authorizePermissionV1'
+]) {
+  if (!permissionServiceSource.includes(marker)) {
+    fail(`PermissionService structure changed; missing marker: ${marker}`);
+  }
 }
 
 const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
@@ -67,7 +82,7 @@ if ((resolverSource.match(availabilitySource) || []).length !== 1) {
 
 const creationGuardSource = /input\.accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*!env\.dev\s*&&\s*!env\.namespaces\.canary/gm;
 if ((resolverSource.match(creationGuardSource) || []).length !== 1) {
-  fail('Expected exactly one READ_WRITE credential creation guard in resolver source.');
+  fail('Expected exactly one READ_WRITE credential creation guard in source.');
 }
 
 const originalBundle = fs.readFileSync(bundlePath, 'utf8');
@@ -125,36 +140,11 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// 4) Capture the already-instantiated global BackendRuntimeProvider deterministically.
-// BackendRuntimeModule is @Global() upstream; this adds no alternate runtime and
-// does not walk private object graphs. It only keeps the real Nest instance that
-// AFFiNE itself creates so MCP lifecycle tools can call the same domain command
-// as the native sync gateway.
-const runtimeMethodMatches = [...patchedBundle.matchAll(/async\s+executeDomainCommandV1\([^)]*\)\{/g)];
-if (runtimeMethodMatches.length !== 1) {
-  fail(`backend runtime capture: expected one executeDomainCommandV1 method, found ${runtimeMethodMatches.length}.`);
-}
-const runtimeMethodIndex = runtimeMethodMatches[0].index;
-const runtimeClassIndex = patchedBundle.lastIndexOf('class ', runtimeMethodIndex);
-if (runtimeClassIndex < 0) {
-  fail('backend runtime capture: could not locate containing class.');
-}
-const runtimeConstructorMatches = [...patchedBundle.slice(runtimeClassIndex, runtimeMethodIndex).matchAll(/constructor\([^)]*\)\{/g)];
-if (runtimeConstructorMatches.length !== 1) {
-  fail(`backend runtime capture: expected one constructor before executeDomainCommandV1, found ${runtimeConstructorMatches.length}.`);
-}
-const runtimeCtor = runtimeConstructorMatches[0];
-const runtimeCtorIndex = runtimeClassIndex + runtimeCtor.index;
-applyExactAt(
-  runtimeCtorIndex,
-  runtimeCtor[0],
-  `${runtimeCtor[0]}globalThis.__affineMcpBackendRuntime=this;`,
-  'backend runtime capture'
-);
-
-// 5) AFFiNE upstream does not publish lifecycle tools in WorkspaceMcpProvider.
-// Add exactly trash/restore/delete inside the existing READ_WRITE branch. The
-// authenticated MCP context already supplies userId/workspaceId and permissions.
+// 4) AFFiNE upstream does not publish lifecycle tools in WorkspaceMcpProvider.
+// Add exactly trash/restore/delete inside the existing READ_WRITE branch.
+// PermissionAccess already owns PermissionService, and PermissionService owns the
+// actual BackendRuntimeProvider through Nest DI. This uses that existing chain
+// directly: this.ac.permission.runtime. No extra runtime, session or socket auth.
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -197,7 +187,7 @@ name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(n).assert(${JSON.stringify(permission)});let u=globalThis.__affineMcpBackendRuntime;if(!u||typeof u.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE BackendRuntimeProvider is not initialized\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
+execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(n).assert(${JSON.stringify(permission)});let p=this.ac&&this.ac.permission;let u=p&&p.runtime;if(!u||typeof u.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE permission runtime is unavailable\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
 }`;
 
 const injected = `;${toolsVar}.push(${[
@@ -242,8 +232,7 @@ for (const marker of [
   'apply_doc_lifecycle',
   'Doc.Trash',
   'Doc.Restore',
-  'Doc.Delete',
-  '__affineMcpBackendRuntime'
+  'Doc.Delete'
 ]) {
   if (!patchedBundle.includes(marker)) {
     fail(`Tool marker disappeared: ${marker}`);
@@ -251,4 +240,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the authenticated MCP context.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the existing permission runtime.');
