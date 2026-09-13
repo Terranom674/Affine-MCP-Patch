@@ -85,100 +85,31 @@ function applyUnique(regex, replacer, label) {
   changes.push({ label, original, replacement });
 }
 
-function applyExactAt(index, original, replacement, label) {
-  if (index < 0 || patchedBundle.slice(index, index + original.length) !== original) {
-    fail(`${label}: target fragment changed before patching.`);
-  }
-  if (!replacement || replacement === original) {
-    fail(`${label}: refusing no-op patch.`);
-  }
-  patchedBundle = patchedBundle.slice(0, index) + replacement + patchedBundle.slice(index + original.length);
-  changes.push({ label, original, replacement });
-}
-
 const ident = '[A-Za-z_$][\\w$]*';
 const chain = `${ident}(?:\\.${ident})*`;
 
 // 1) Provider: expose write tools when the explicit env switch is true.
 applyUnique(
   new RegExp(`(${chain})\\s*===\\s*(${chain})\\.READ_WRITE\\s*&&\\s*\\(\\s*(${chain})\\.dev\\s*\\|\\|\\s*\\3\\.namespaces\\.canary\\s*\\)`, 'g'),
-  m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\")`,
+  m => `${m[1]}===${m[2]}.READ_WRITE&&(${m[3]}.dev||${m[3]}.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true")`,
   'provider write gate'
 );
 
 // 2) GraphQL capability flag: report READ_WRITE as available under the same switch.
 applyUnique(
   /mcpCredentialReadWriteAvailable\(\)\{return env\.dev\|\|env\.namespaces\.canary\}/g,
-  'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED===\"true\"}',
+  'mcpCredentialReadWriteAvailable(){return env.dev||env.namespaces.canary||process.env.AFFINE_MCP_WRITE_ENABLED==="true"}',
   'resolver availability gate'
 );
 
 // 3) GraphQL credential creation guard: do not reject READ_WRITE when switch is true.
 applyUnique(
   new RegExp(`(\\.accessMode\\s*===\\s*${chain}\\.READ_WRITE\\s*&&\\s*!env\\.dev\\s*&&\\s*!env\\.namespaces\\.canary)`, 'g'),
-  m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!==\"true\"`,
+  m => `${m[1]}&&process.env.AFFINE_MCP_WRITE_ENABLED!=="true"`,
   'resolver credential creation gate'
 );
 
-// 4) Native MCP is missing AFFiNE's existing document lifecycle operations.
-// Add trash/restore/delete inside the existing READ_WRITE branch and delegate to
-// the same backend runtime command used by AFFiNE's own sync gateway. The MCP
-// provider already owns PermissionAccess, whose PermissionService owns the same
-// BackendRuntimeProvider through Nest DI, so discover that runtime from the
-// provider object graph instead of guessing private DocWriter field names.
-const metaMarker = 'update_document_meta';
-const metaPositions = [];
-for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
-  metaPositions.push(pos);
-}
-if (metaPositions.length !== 1) {
-  fail(`document lifecycle tools: expected one ${metaMarker} marker in compiled bundle, found ${metaPositions.length}.`);
-}
-const markerPos = metaPositions[0];
-
-const forMatches = [...patchedBundle.slice(0, markerPos).matchAll(/async\s+for\(([^)]*)\)\{/g)];
-if (!forMatches.length) {
-  fail('document lifecycle tools: could not locate compiled WorkspaceMcpProvider.for signature.');
-}
-const forMatch = forMatches[forMatches.length - 1];
-const rawParams = forMatch[1].split(',').map(value => value.trim());
-const userVar = (rawParams[0] || '').match(/^([A-Za-z_$][\w$]*)/)?.[1];
-const workspaceVar = (rawParams[1] || '').match(/^([A-Za-z_$][\w$]*)/)?.[1];
-if (!userVar || !workspaceVar) {
-  fail('document lifecycle tools: could not resolve user/workspace variables from compiled provider signature.');
-}
-
-const searchEnd = Math.min(patchedBundle.length, markerPos + 10000);
-const tail = patchedBundle.slice(markerPos, searchEnd);
-const pushCandidates = [...tail.matchAll(/([A-Za-z_$][\w$]*)\.push\(([^()]{1,500})\)/g)]
-  .filter(match => {
-    const args = match[2].split(',').map(value => value.trim());
-    return args.length === 3 && args.every(value => /^[A-Za-z_$][\w$]*$/.test(value));
-  });
-if (pushCandidates.length < 1) {
-  fail('document lifecycle tools: could not locate compiled write-tool push call.');
-}
-const pushMatch = pushCandidates[0];
-const toolsVar = pushMatch[1];
-const pushIndex = markerPos + pushMatch.index;
-const pushCall = pushMatch[0];
-
-const lifecycleTool = (name, title, lifecycle, permission, description) => `{
-name:${JSON.stringify(name)},
-title:${JSON.stringify(title)},
-description:${JSON.stringify(description)},
-inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{if(!this.ac||typeof this.ac.user!==\"function\")throw new Error(\"AFFiNE PermissionAccess unavailable from MCP provider\");await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(n).assert(${JSON.stringify(permission)});let q=[this],v=new Set,u;for(let d=0;d<6&&q.length&&!u;d++){let z=q.splice(0);for(let o of z){if(!o||(typeof o!==\"object\"&&typeof o!==\"function\")||v.has(o))continue;v.add(o);if(typeof o.executeDomainCommandV1===\"function\"){u=o;break}let ds;try{ds=Object.getOwnPropertyDescriptors(o)}catch{continue}for(let k of Object.keys(ds)){let p=ds[k];if(!p||!(\"value\" in p))continue;let x=p.value;if(x&&(typeof x===\"object\"||typeof x===\"function\"))q.push(x)}}}if(!u)throw new Error(\"AFFiNE BackendRuntimeProvider unavailable from MCP provider object graph\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
-}`;
-
-const injected = `;${toolsVar}.push(${[
-  lifecycleTool('trash_document', 'Trash Document', 'trash', 'Doc.Trash', 'Move a document to the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('restore_document', 'Restore Document', 'restore', 'Doc.Restore', 'Restore a document from the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('delete_document', 'Delete Document', 'delete', 'Doc.Delete', 'Permanently delete a document using AFFiNE native document lifecycle handling. This cannot be undone.'),
-].join(',')})`;
-applyExactAt(pushIndex, pushCall, pushCall + injected, 'document lifecycle tools');
-
-// Hard verification: only the explicitly recorded substitutions are allowed.
+// Hard verification: only these three exact substitutions are allowed.
 let reconstructed = originalBundle;
 for (const change of changes) {
   const count = reconstructed.split(change.original).length - 1;
@@ -188,7 +119,7 @@ for (const change of changes) {
   reconstructed = reconstructed.replace(change.original, change.replacement);
 }
 if (reconstructed !== patchedBundle) {
-  fail('Bundle contains changes outside the recorded MCP patches.');
+  fail('Bundle contains changes outside the three MCP write conditions.');
 }
 
 let reversed = patchedBundle;
@@ -203,22 +134,11 @@ if (reversed !== originalBundle) {
   fail('Patch is not exactly reversible to the upstream bundle.');
 }
 
-for (const marker of [
-  'create_document',
-  'update_document',
-  'update_document_meta',
-  'trash_document',
-  'restore_document',
-  'delete_document',
-  'apply_doc_lifecycle',
-  'Doc.Trash',
-  'Doc.Restore',
-  'Doc.Delete'
-]) {
+for (const marker of ['create_document', 'update_document', 'update_document_meta']) {
   if (!patchedBundle.includes(marker)) {
     fail(`Tool marker disappeared: ${marker}`);
   }
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and added native trash/restore/delete MCP tools using AFFiNE permissions and BackendRuntimeProvider.');
+console.log('[AFFiNE MCP Patch] Applied exactly three MCP WRITE condition changes; no other bundle content changed.');
