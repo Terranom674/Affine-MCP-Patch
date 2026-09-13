@@ -1,66 +1,44 @@
 # AFFiNE MCP Patch
 
-Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images und schaltet gezielt die bereits vorhandenen MCP-Schreibfunktionen fuer Self-Hosted-Installationen frei, ohne `AFFINE_ENV=dev` zu setzen.
+Dieses Repository baut ein eigenes AFFiNE-Docker-Image auf Basis des offiziellen Stable-Images. Der Patch schaltet den vorhandenen READ_WRITE-MCP fuer Self-Hosted-Installationen frei und ergaenzt genau ein fehlendes Werkzeug: `delete_document`.
 
-## Harte Regel
+## Umfang
 
-Am AFFiNE-Core wird **nichts** geaendert ausser genau der vorhandenen MCP-Write-Bedingung.
+Der bestehende WRITE-Gate wird nur um `AFFINE_MCP_WRITE_ENABLED=true` erweitert. Die nativen Werkzeuge `read_document`, `doc_search`, `create_document`, `update_document` und `update_document_meta` bleiben unveraendert.
 
-Sinngemaess wird nur:
+Zusaetzlich wird `delete_document` in denselben bereits authentifizierten READ_WRITE-MCP-Kontext aufgenommen. Der Aufruf verwendet die vorhandenen `userId`- und `workspaceId`-Werte und prueft vor jeder Aenderung ueber AFFiNE selbst `Doc.Delete`.
 
-```ts
-accessMode === McpAccessMode.READ_WRITE &&
-(env.dev || env.namespaces.canary)
-```
+Beim Delete wird der Dokumenteintrag aus `meta.pages` des Workspace-Root-Dokuments entfernt und danach AFFiNEs vorhandenes `DocModel.delete(workspaceId, docId)` fuer Snapshots, Updates und Historien verwendet.
 
-zu:
+## Fail closed
 
-```ts
-accessMode === McpAccessMode.READ_WRITE &&
-(
-  env.dev ||
-  env.namespaces.canary ||
-  process.env.AFFINE_MCP_WRITE_ENABLED === 'true'
-)
-```
+Der Patch fuehrt vor jeder Aenderung harte Strukturpruefungen gegen Source Map und kompiliertes Bundle aus. Erwartet werden unter anderem:
 
-Alle bestehenden AFFiNE-Berechtigungspruefungen, Authentifizierung, DocWriter-Logik, GraphQL, Datenbanklogik, Migrationen und MCP-Tools bleiben unveraendert.
+- genau ein Workspace-MCP-Provider und Resolver
+- die bekannten drei READ_WRITE-Gates
+- die unveraenderte `DocWriter`-/Workspace-Adapter-Struktur
+- die vorhandene `DocModel.delete()`-Implementierung
+- die vorhandene Permission-Builder-Struktur fuer `Doc.Delete`
+- genau ein passender Write-Tool-Push im MCP-Provider
 
-## Keine Versionsbindung
+Passt eine dieser Annahmen nicht exakt, bricht der Build ab. `main.js` wird erst nach allen Pruefungen geschrieben. Alle vorgenommenen Bundle-Aenderungen werden vor dem Schreiben vorwaerts und rueckwaerts rekonstruiert und muessen exakt aufgehen.
 
-Der Patch ist absichtlich nicht an eine konkrete AFFiNE-Version oder einen Bundle-Hash gebunden.
+## Yjs
 
-Bei jedem Build wird die tatsaechliche Struktur des verwendeten offiziellen AFFiNE-Images geprueft:
+Fuer die gezielte Aenderung des Root-Dokuments installiert das Patch-Image `yjs@13.6.21` fest unter `/opt/affine-mcp-patch/node_modules/yjs`. Dadurch ist die verwendete Laufzeit nicht von zufaellig vorhandenen Node-Modulen des AFFiNE-Images abhaengig.
 
-1. `main.js.map` muss genau einen `plugins/copilot/mcp/provider.ts` enthalten.
-2. Der Provider muss weiterhin den bekannten `READ_WRITE`-Gate und die vorhandenen Schreibwerkzeuge enthalten.
-3. Im kompilierten Bundle muss dieser Gate genau einmal eindeutig gefunden werden.
-4. Nur diese eine Bedingung wird um `AFFINE_MCP_WRITE_ENABLED` erweitert.
-5. Danach wird bytegenau geprueft, dass der gesamte restliche Bundle-Inhalt unveraendert geblieben ist.
-6. Wenn die Struktur nicht mehr eindeutig passt, bricht der Build ab.
-
-## Sicherheitsprinzip
-
-Der Patch arbeitet **fail closed**:
+## Sicherheit
 
 - offizielles `ghcr.io/toeverything/affine:stable` bleibt die Basis
-- keine feste AFFiNE-Version
-- keine Hash-Liste
-- keine Aenderungen an Auth, Permissions, DocWriter, GraphQL, Datenbank oder Migrationen
-- keine neuen MCP-Funktionen
-- keine automatische GitHub Action
+- bestehender `aff_mcp_v1...`-Credential bleibt der einzige Authentifizierungspfad
+- keine zusaetzlichen Logins, JWTs, Cookies oder Socket.IO-Pfade
+- Permission-Pruefung bleibt bei AFFiNE
+- kein Trash-/Restore-Patch
+- keine direkte Datenbankverbindung des Connectors
+- keine GitHub Actions
 - kein automatisches Deployment
-- bei unklarer Upstream-Struktur: Build-Abbruch
-
-## Dateien
-
-- `Dockerfile` - baut das angepasste Image aus dem aktuellen Upstream-Image
-- `patch-mcp.js` - erkennt und aendert ausschliesslich den MCP-Write-Gate
-- `compose.example.yml` - Beispiel fuer die Einbindung in Docker Compose
 
 ## Aktivierung
-
-AFFiNE bleibt im Production-Namespace. Die Schreibfreigabe erfolgt separat:
 
 ```yaml
 environment:
@@ -68,7 +46,14 @@ environment:
   AFFINE_MCP_WRITE_ENABLED: "true"
 ```
 
-Ohne `AFFINE_MCP_WRITE_ENABLED=true` verhaelt sich der gepatchte Gate wie der originale Production-Gate.
+## Erwartete MCP-Werkzeuge
+
+- `read_document`
+- `doc_search`
+- `create_document`
+- `update_document`
+- `update_document_meta`
+- `delete_document`
 
 ## Build
 
@@ -76,4 +61,4 @@ Ohne `AFFINE_MCP_WRITE_ENABLED=true` verhaelt sich der gepatchte Gate wie der or
 docker build --pull -t affine-mcp-patched .
 ```
 
-Bei einem AFFiNE-Update wird derselbe Build erneut ausgefuehrt. Solange die relevante MCP-Struktur kompatibel bleibt, wird das neue Image gepatcht. Aendert AFFiNE diese Struktur, stoppt der Build und muss zuerst geprueft werden.
+Aendert ein AFFiNE-Update die gepruefte Struktur, stoppt der Build und der Patch muss zuerst an den neuen Stable-Core angepasst werden.
