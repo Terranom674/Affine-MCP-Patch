@@ -122,8 +122,10 @@ applyUnique(
 
 // 4) Native MCP is missing AFFiNE's existing document lifecycle operations.
 // Add trash/restore/delete inside the existing READ_WRITE branch and delegate to
-// the backend runtime command used by AFFiNE's own sync gateway. This preserves
-// AFFiNE's permission checks and canonical root-document lifecycle handling.
+// the same backend runtime command used by AFFiNE's own sync gateway. The MCP
+// provider already owns PermissionAccess, whose PermissionService owns the same
+// BackendRuntimeProvider through Nest DI, so discover that runtime from the
+// provider object graph instead of guessing private DocWriter field names.
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -161,18 +163,18 @@ const toolsVar = pushMatch[1];
 const pushIndex = markerPos + pushMatch.index;
 const pushCall = pushMatch[0];
 
-const lifecycleTool = (name, title, lifecycle, description) => `{
+const lifecycleTool = (name, title, lifecycle, permission, description) => `{
 name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{let q=[this.writer],v=new Set,u;for(let d=0;d<5&&q.length&&!u;d++){let z=q.splice(0);for(let o of z){if(!o||(typeof o!==\"object\"&&typeof o!==\"function\")||v.has(o))continue;v.add(o);if(typeof o.executeDomainCommandV1===\"function\"){u=o;break}for(let x of Object.values(o)){if(x&&(typeof x===\"object\"||typeof x===\"function\"))q.push(x)}}}if(!u)throw new Error(\"AFFiNE backend runtime unavailable from DocWriter object graph\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
+execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{if(!this.ac||typeof this.ac.user!==\"function\")throw new Error(\"AFFiNE PermissionAccess unavailable from MCP provider\");await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(n).assert(${JSON.stringify(permission)});let q=[this],v=new Set,u;for(let d=0;d<6&&q.length&&!u;d++){let z=q.splice(0);for(let o of z){if(!o||(typeof o!==\"object\"&&typeof o!==\"function\")||v.has(o))continue;v.add(o);if(typeof o.executeDomainCommandV1===\"function\"){u=o;break}let ds;try{ds=Object.getOwnPropertyDescriptors(o)}catch{continue}for(let k of Object.keys(ds)){let p=ds[k];if(!p||!(\"value\" in p))continue;let x=p.value;if(x&&(typeof x===\"object\"||typeof x===\"function\"))q.push(x)}}}if(!u)throw new Error(\"AFFiNE BackendRuntimeProvider unavailable from MCP provider object graph\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
 }`;
 
 const injected = `;${toolsVar}.push(${[
-  lifecycleTool('trash_document', 'Trash Document', 'trash', 'Move a document to the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('restore_document', 'Restore Document', 'restore', 'Restore a document from the AFFiNE trash using AFFiNE native document lifecycle handling.'),
-  lifecycleTool('delete_document', 'Delete Document', 'delete', 'Permanently delete a document using AFFiNE native document lifecycle handling. This cannot be undone.'),
+  lifecycleTool('trash_document', 'Trash Document', 'trash', 'Doc.Trash', 'Move a document to the AFFiNE trash using AFFiNE native document lifecycle handling.'),
+  lifecycleTool('restore_document', 'Restore Document', 'restore', 'Doc.Restore', 'Restore a document from the AFFiNE trash using AFFiNE native document lifecycle handling.'),
+  lifecycleTool('delete_document', 'Delete Document', 'delete', 'Doc.Delete', 'Permanently delete a document using AFFiNE native document lifecycle handling. This cannot be undone.'),
 ].join(',')})`;
 applyExactAt(pushIndex, pushCall, pushCall + injected, 'document lifecycle tools');
 
@@ -208,7 +210,10 @@ for (const marker of [
   'trash_document',
   'restore_document',
   'delete_document',
-  'apply_doc_lifecycle'
+  'apply_doc_lifecycle',
+  'Doc.Trash',
+  'Doc.Restore',
+  'Doc.Delete'
 ]) {
   if (!patchedBundle.includes(marker)) {
     fail(`Tool marker disappeared: ${marker}`);
@@ -216,4 +221,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and added native trash/restore/delete MCP tools with AFFiNE permission enforcement.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and added native trash/restore/delete MCP tools using AFFiNE permissions and BackendRuntimeProvider.');
