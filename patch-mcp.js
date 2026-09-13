@@ -138,23 +138,32 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// PermissionService already owns the real BackendRuntimeProvider through Nest DI.
-// Add a narrow internal delegate so callers never need to reach into its private
-// runtime field from outside the class.
+// Discover the actual minified PermissionService runtime property from the
+// compiled authorizePermissionV1 call, then inject the delegate next to an
+// existing public method. Never assume the source property name survives bundling.
+const runtimeRefs = [...patchedBundle.matchAll(/(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(/g)];
+if (runtimeRefs.length !== 1) {
+  fail(`permission service runtime: expected exactly one compiled authorizePermissionV1 receiver, found ${runtimeRefs.length}.`);
+}
+const runtimeExpr = runtimeRefs[0][1];
 applyUnique(
   /async workspacePermissions\(([^)]*)\)\{/g,
-  m => `async executeDomainCommandV1(__affineMcpCommand){return await this.runtime.executeDomainCommandV1(__affineMcpCommand)}async workspacePermissions(${m[1]}){`,
+  m => `async executeDomainCommandV1(__affineMcpCommand){return await ${runtimeExpr}.executeDomainCommandV1(__affineMcpCommand)}async workspacePermissions(${m[1]}){`,
   'permission service runtime delegate'
 );
 
-// PermissionAccess already owns PermissionService through Nest DI. Add a second
-// narrow delegate here so WorkspaceMcpProvider only calls a public method on the
-// dependency it already receives.
-applyUnique(
-  /user\(([^)]*)\)\{return new ([A-Za-z_$][\w$]*)\(([^)]*)\)\}/g,
-  m => `executeDomainCommandV1(__affineMcpCommand){return this.permission.executeDomainCommandV1(__affineMcpCommand)}user(${m[1]}){return new ${m[2]}(${m[3]})}`,
-  'permission access runtime delegate'
-);
+// Discover the actual minified PermissionAccess permission field from the
+// compiled user() factory call and reuse that exact receiver in the delegate.
+const accessUserMatches = [...patchedBundle.matchAll(/user\(([^)]*)\)\{return new ([A-Za-z_$][\w$]*)\(([^,()]+),(this\.[A-Za-z_$][\w$]*)\)\}/g)];
+if (accessUserMatches.length !== 1) {
+  fail(`permission access runtime: expected exactly one compiled user() factory, found ${accessUserMatches.length}.`);
+}
+const accessUserMatch = accessUserMatches[0];
+const permissionExpr = accessUserMatch[4];
+const accessUserIndex = accessUserMatch.index;
+const accessUserOriginal = accessUserMatch[0];
+const accessUserReplacement = `executeDomainCommandV1(__affineMcpCommand){return ${permissionExpr}.executeDomainCommandV1(__affineMcpCommand)}${accessUserOriginal}`;
+applyExactAt(accessUserIndex, accessUserOriginal, accessUserReplacement, 'permission access runtime delegate');
 
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
@@ -251,4 +260,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through PermissionAccess and PermissionService delegates.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through compiled DI delegates.');
