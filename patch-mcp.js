@@ -27,6 +27,8 @@ function sourceEndingWith(suffix) {
 
 const providerSource = sourceEndingWith('plugins/copilot/mcp/provider.ts');
 const resolverSource = sourceEndingWith('plugins/copilot/mcp/resolver.ts');
+const permissionBuilderSource = sourceEndingWith('core/permission/builder.ts');
+const permissionServiceSource = sourceEndingWith('core/permission/service.ts');
 
 for (const marker of [
   'McpAccessMode.READ_WRITE',
@@ -51,6 +53,24 @@ for (const marker of [
   }
 }
 
+for (const marker of [
+  'export class AccessControllerBuilder',
+  'return new UserAccessControllerBuilder(userId, this.permission)'
+]) {
+  if (!permissionBuilderSource.includes(marker)) {
+    fail(`PermissionAccess structure changed; missing marker: ${marker}`);
+  }
+}
+
+for (const marker of [
+  'export class PermissionService',
+  'this.runtime.authorizePermissionV1'
+]) {
+  if (!permissionServiceSource.includes(marker)) {
+    fail(`PermissionService structure changed; missing marker: ${marker}`);
+  }
+}
+
 const providerGateSource = /accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*\(\s*env\.dev\s*\|\|\s*env\.namespaces\.canary\s*\)/gm;
 if ((providerSource.match(providerGateSource) || []).length !== 1) {
   fail('Expected exactly one provider READ_WRITE gate in source.');
@@ -58,7 +78,7 @@ if ((providerSource.match(providerGateSource) || []).length !== 1) {
 
 const availabilitySource = /mcpCredentialReadWriteAvailable\(\)\s*\{\s*return\s+env\.dev\s*\|\|\s*env\.namespaces\.canary;?\s*\}/gm;
 if ((resolverSource.match(availabilitySource) || []).length !== 1) {
-  fail('Expected exactly one READ_WRITE availability gate in source.');
+  fail('Expected exactly one READ_WRITE availability gate in resolver source.');
 }
 
 const creationGuardSource = /input\.accessMode\s*===\s*McpAccessMode\.READ_WRITE\s*&&\s*!env\.dev\s*&&\s*!env\.namespaces\.canary/gm;
@@ -118,6 +138,24 @@ applyUnique(
   'resolver credential creation gate'
 );
 
+// PermissionService already owns the real BackendRuntimeProvider through Nest DI.
+// Add a narrow internal delegate so callers never need to reach into its private
+// runtime field from outside the class.
+applyUnique(
+  /async workspacePermissions\(([^)]*)\)\{/g,
+  m => `async executeDomainCommandV1(__affineMcpCommand){return await this.runtime.executeDomainCommandV1(__affineMcpCommand)}async workspacePermissions(${m[1]}){`,
+  'permission service runtime delegate'
+);
+
+// PermissionAccess already owns PermissionService through Nest DI. Add a second
+// narrow delegate here so WorkspaceMcpProvider only calls a public method on the
+// dependency it already receives.
+applyUnique(
+  /user\(([^)]*)\)\{return new ([A-Za-z_$][\w$]*)\(([^)]*)\)\}/g,
+  m => `executeDomainCommandV1(__affineMcpCommand){return this.permission.executeDomainCommandV1(__affineMcpCommand)}user(${m[1]}){return new ${m[2]}(${m[3]})}`,
+  'permission access runtime delegate'
+);
+
 const metaMarker = 'update_document_meta';
 const metaPositions = [];
 for (let pos = patchedBundle.indexOf(metaMarker); pos !== -1; pos = patchedBundle.indexOf(metaMarker, pos + 1)) {
@@ -128,9 +166,6 @@ if (metaPositions.length !== 1) {
 }
 const markerPos = metaPositions[0];
 
-// Resolve the authenticated MCP context from AFFiNE's own compiled permission
-// check instead of guessing the enclosing method parameter list. This uniquely
-// identifies the real user/workspace variables used by WorkspaceMcpProvider.
 const contextStart = Math.max(0, markerPos - 20000);
 const contextChunk = patchedBundle.slice(contextStart, markerPos);
 const contextMatches = [...contextChunk.matchAll(/\.user\(([^()]+)\)\.workspace\(([^()]+)\)\.assert\((['\"])Workspace\.Read\3\)/g)];
@@ -158,15 +193,12 @@ const toolsVar = pushMatch[1];
 const pushIndex = markerPos + pushMatch.index;
 const pushCall = pushMatch[0];
 
-// IMPORTANT: the minified outer user/workspace variables are often named e/t.
-// Never reuse short parameter names in the injected execute closure or they can
-// shadow the authenticated MCP context. Use collision-resistant names instead.
 const lifecycleTool = (name, title, lifecycle, permission, description) => `{
 name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpPermission=this.ac&&this.ac.permission;let __affineMcpRuntime=__affineMcpPermission&&__affineMcpPermission.runtime;if(!__affineMcpRuntime||typeof __affineMcpRuntime.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE permission runtime is unavailable\");let __affineMcpResult=await __affineMcpRuntime.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
+execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpResult=await this.ac.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
 }`;
 
 const injected = `;${toolsVar}.push(${[
@@ -208,6 +240,7 @@ for (const marker of [
   'restore_document',
   'delete_document',
   'apply_doc_lifecycle',
+  'executeDomainCommandV1',
   'Doc.Trash',
   'Doc.Restore',
   'Doc.Delete'
@@ -218,4 +251,4 @@ for (const marker of [
 }
 
 fs.writeFileSync(bundlePath, patchedBundle);
-console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through the authenticated MCP context.');
+console.log('[AFFiNE MCP Patch] Enabled READ_WRITE and native trash/restore/delete tools through PermissionAccess and PermissionService delegates.');
