@@ -118,13 +118,13 @@ applyUnique(
   'resolver credential creation gate'
 );
 
-// Capture AFFiNE's real BackendRuntimeProvider singleton at an existing,
-// authenticated PermissionService call. We do not add methods to minified
-// classes and do not assume any private property name.
+// Capture only PermissionService.authorize(): its call is uniquely shaped as
+// runtime.authorizePermissionV1({version:1,...input}). Other AFFiNE services
+// also call authorizePermissionV1, so a global receiver match is incorrect.
 applyUnique(
-  /(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(/g,
-  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1(`,
-  'backend runtime capture'
+  /(this\.[A-Za-z_$][\w$]*)\.authorizePermissionV1\(\{version:1,\.\.\.([A-Za-z_$][\w$]*)\}\)/g,
+  m => `(globalThis.__affineMcpBackendRuntime=${m[1]}).authorizePermissionV1({version:1,...${m[2]}})`,
+  'permission service backend runtime capture'
 );
 
 const metaMarker = 'update_document_meta';
