@@ -153,8 +153,16 @@ printf '%s\n' "$TABLES"
 printf '%s\n' "$TABLES" | grep -q 'block' || fail "ManticoreSearch block table was not created"
 printf '%s\n' "$TABLES" | grep -q 'doc' || fail "ManticoreSearch doc table was not created"
 
-echo "--- MCP response ---"
-curl -i -sS -X POST "http://127.0.0.1:3010/api/workspaces/test/mcp/" \
+echo "--- MCP auth protection check ---"
+MCP_BODY="$(mktemp)"
+trap 'rm -f "$MCP_BODY"' EXIT
+MCP_STATUS="$(curl -sS -o "$MCP_BODY" -w '%{http_code}' -X POST "http://127.0.0.1:3010/api/workspaces/test/mcp/" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"patch-test","version":"1.0"}}}'
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"patch-test","version":"1.0"}}}')"
+printf 'HTTP %s\n' "$MCP_STATUS"
+cat "$MCP_BODY"
+printf '\n'
+[ "$MCP_STATUS" = "401" ] || fail "expected unauthenticated MCP request to be rejected with HTTP 401, got $MCP_STATUS"
+grep -q 'Authentication failed' "$MCP_BODY" || fail "MCP endpoint returned 401 without the expected authentication failure payload"
+echo "MCP endpoint reachable; unauthenticated access correctly rejected."
