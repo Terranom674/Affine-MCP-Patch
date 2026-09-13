@@ -158,12 +158,15 @@ const toolsVar = pushMatch[1];
 const pushIndex = markerPos + pushMatch.index;
 const pushCall = pushMatch[0];
 
+// IMPORTANT: the minified outer user/workspace variables are often named e/t.
+// Never reuse short parameter names in the injected execute closure or they can
+// shadow the authenticated MCP context. Use collision-resistant names instead.
 const lifecycleTool = (name, title, lifecycle, permission, description) => `{
 name:${JSON.stringify(name)},
 title:${JSON.stringify(title)},
 description:${JSON.stringify(description)},
 inputSchema:{type:\"object\",properties:{docId:{type:\"string\",description:\"The document ID\"}},required:[\"docId\"],additionalProperties:false},
-execute:async(e,t)=>{if(t&&t.signal&&t.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let n=e&&e.docId;if(typeof n!==\"string\"||!n)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(n).assert(${JSON.stringify(permission)});let p=this.ac&&this.ac.permission;let u=p&&p.runtime;if(!u||typeof u.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE permission runtime is unavailable\");let r=await u.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:n,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:n,lifecycle:${JSON.stringify(lifecycle)},result:r})}]}}catch(e){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(e instanceof Error?e.message:String(e))}]}}}
+execute:async(__affineMcpArgs,__affineMcpOptions)=>{if(__affineMcpOptions&&__affineMcpOptions.signal&&__affineMcpOptions.signal.aborted)return{isError:true,content:[{type:\"text\",text:\"Request aborted.\"}]};let __affineMcpDocId=__affineMcpArgs&&__affineMcpArgs.docId;if(typeof __affineMcpDocId!==\"string\"||!__affineMcpDocId)return{isError:true,content:[{type:\"text\",text:\"Invalid arguments: docId is required\"}]};try{await this.ac.user(${userVar}).workspace(${workspaceVar}).doc(__affineMcpDocId).assert(${JSON.stringify(permission)});let __affineMcpPermission=this.ac&&this.ac.permission;let __affineMcpRuntime=__affineMcpPermission&&__affineMcpPermission.runtime;if(!__affineMcpRuntime||typeof __affineMcpRuntime.executeDomainCommandV1!==\"function\")throw new Error(\"AFFiNE permission runtime is unavailable\");let __affineMcpResult=await __affineMcpRuntime.executeDomainCommandV1({command:\"apply_doc_lifecycle\",actorUserId:${userVar},workspaceId:${workspaceVar},docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)}});return{content:[{type:\"text\",text:JSON.stringify({success:true,docId:__affineMcpDocId,lifecycle:${JSON.stringify(lifecycle)},result:__affineMcpResult})}]}}catch(__affineMcpError){return{isError:true,content:[{type:\"text\",text:${JSON.stringify(`Failed to ${lifecycle} document: `)}+(__affineMcpError instanceof Error?__affineMcpError.message:String(__affineMcpError))}]}}}
 }`;
 
 const injected = `;${toolsVar}.push(${[
